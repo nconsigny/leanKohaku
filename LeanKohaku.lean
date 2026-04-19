@@ -27,3 +27,4 @@ import LeanKohaku.Cli.Commands
 import LeanKohaku.Invariants.Amount
 import LeanKohaku.Invariants.Nonce
 import LeanKohaku.Invariants.TxWellFormed
+import LeanKohaku.Invariants.Wallet

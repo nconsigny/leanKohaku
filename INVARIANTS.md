@@ -24,10 +24,15 @@ be a catastrophic bug for wallet accounting.
 
 ### 1.2 Sum of outputs ≤ available balance
 For any multi-output send, the wallet refuses to sign unless the sum of
-outgoing amounts plus fees is ≤ the sending account's balance.
+outgoing amounts plus fees is ≤ the sending account's balance. The abstract
+model is in `LeanKohaku/Invariants/Wallet.lean`: `State`, `Send`, `apply`.
 
-**Prop:** TBD (needs an abstract `WalletState` first)
-**Status:** 📝 stated
+**Props:**
+- `apply_some_affordable` — `apply σ s = some σ' → s.affordable σ`
+- `apply_sender_debited` — `apply σ s = some σ' → σ'.balance s.sender + s.total = σ.balance s.sender`
+- `apply_non_sender_balance` — non-sender accounts grow by exactly the sum of outputs addressed to them.
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Wallet.lean`
 
 ---
 

@@ -75,6 +75,7 @@ See [`INVARIANTS.md`](./INVARIANTS.md). The current proved inventory:
 | # | Invariant | Status |
 |---|-----------|--------|
 | 1.1 | Checked subtraction preserves totals | ✅ |
+| 1.2 | Multi-output send — refuse-insufficient + exact-debit + recipient crediting | ✅ |
 | 2.1 | EIP-1559 fee relation | ✅ (by definition) |
 | 2.3 | Chain-ID match | ✅ (by definition) |
 | everything else | — | 📝 / 🚧 |
