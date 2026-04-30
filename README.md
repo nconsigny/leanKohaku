@@ -20,11 +20,12 @@ critical signing path.
   each invariant from 📝 (stated) → 🚧 (in progress) → ✅ (proved).
 - **Privacy and security by default.** The CLI is not allowed to contact
   nodes or third-party APIs directly. Network-capable daemon operations
-  are classified by peer and purpose, with a deny-by-default policy and
-  Lean invariants for the strict policy.
-- **Tor as an explicit transport.** Inspired by Cake Wallet's Tor-only
-  and proxy support, Tor is modeled as a first-class transport to a
-  configured node, not as permission to use third-party APIs.
+  are classified by peer, purpose, and transport, with a deny-by-default
+  policy and Lean invariants for strict and Tor modes. Third-party APIs,
+  analytics, price feeds, metadata lookups, fiat/onramp calls, crash
+  reports, and discovery are denied.
+- **Tor as an explicit transport.** Tor is modeled as a first-class
+  transport to a configured node, not as permission to use third-party APIs.
 - **Local enclave-first keystore boundary.** Wallet code asks a local
   hardware-backed keystore to create keys, expose public keys, and sign
   digests; it must not use an online keystore or import/export raw secrets
@@ -65,6 +66,7 @@ leanKohaku/
 │  ├─ Encoding/    Rlp
 │  ├─ Ethereum/    Address, Chain, P256Precompile, Tx
 │  ├─ Privacy/     NetworkPolicy
+│  ├─ Network/     Endpoint, Provider
 │  ├─ LightClient/ Provider
 │  ├─ Keystore/    Enclave, Linux
 │  ├─ Contract/    R1Account
@@ -112,83 +114,88 @@ repository URL before publishing a package.
 ./.lake/build/bin/leankohaku wallet create sepolia work-key
 ./.lake/build/bin/leankohaku wallet list sepolia
 ./.lake/build/bin/leankohaku wallet sign sepolia work-key 0x<32-byte-digest>
+./.lake/build/bin/leankohaku network
+./.lake/build/bin/leankohaku security
+./.lake/build/bin/leankohaku doctor
+./.lake/build/bin/leankohaku policy-check strict configured-node broadcast-tx direct
+./.lake/build/bin/leankohaku rpc-check tor configured tor eth_sendRawTransaction
+./.lake/build/bin/leankohaku endpoint-check strict local http loopback false
+./.lake/build/bin/leankohaku endpoint-check tor configured onion tor false
+./.lake/build/bin/leankohaku balance 0x0000000000000000000000000000000000000000
+./.lake/build/bin/leankohaku send 0x0000000000000000000000000000000000000000 1
 ./.lake/build/bin/leankohaku daemon    # starts the daemon (stub for now)
 ```
 
-## Network privacy posture
+## Network Privacy
 
-`LeanKohaku.Privacy.NetworkPolicy` defines the network boundary:
+`LeanKohaku.Privacy.NetworkPolicy` is the deny-by-default boundary:
 
-- The CLI may only speak to the local wallet daemon.
-- The CLI must not call Ethereum nodes, third-party APIs, analytics,
-  price feeds, metadata services, or discovery services.
-- The daemon may read chain state only from a local node or embedded
-  light-client provider.
-- The daemon may broadcast signed transactions only to a local node or an
-  explicitly configured node.
-- Optional Tor mode permits configured-node reads and broadcasts only
-  through Tor.
-- All unclassified network-capable features should use `denyByDefault`
-  until they have a specific invariant.
+- CLI traffic is limited to local daemon control over loopback.
+- Daemon reads use local/light-client loopback by default.
+- Broadcast is limited to `eth_sendRawTransaction`.
+- Strict mode denies configured-node traffic, including direct broadcast.
+- Tor mode may read and broadcast through a configured node over Tor.
+- Third-party APIs remain denied even when Tor is enabled.
+
+Denied categories include peer discovery, analytics, telemetry, price
+quotes, fiat/onramp calls, metadata/indexer APIs, crash reports, and any
+unclassified transport path.
+
+`balance` and `send` are currently preflight-functional: they validate CLI
+inputs, classify the only permitted local-daemon request, and stop before
+network I/O because daemon transport is still a stub. Invalid input exits
+before any daemon or network path is attempted.
+
+The daemon-side plan is also modeled:
+
+- `balance` maps to `eth_getBalance` against the local provider.
+- `send` maps to `eth_sendRawTransaction` against the local provider.
+- Tor mode can later switch the provider plan to a configured node over Tor.
+
+Endpoint hygiene is modeled separately:
+
+- Strict mode accepts only local, uncredentialed endpoints over loopback.
+- Tor mode accepts local loopback endpoints and uncredentialed configured
+  endpoints over Tor.
+- Credentialed endpoints are denied to prevent API-key hosted services.
+- Third-party endpoints are denied in every mode.
+
+Run the privacy CLI regression checks with:
+
+```bash
+./script/check_privacy_cli.sh
+```
+
+More detail:
+
+- [CLI](./docs/CLI.md)
+- [Privacy And Security](./docs/PRIVACY_SECURITY.md)
 
 ## Light client
 
 `LeanKohaku.LightClient.Provider` mirrors the shape of the upstream
 Kohaku provider package: a raw-provider operation surface plus a Helios
 light-client backend option. The current implementation is an abstract,
-policy-checked model rather than a transport implementation. This keeps
-the wallet from silently falling back to third-party APIs while JSON-RPC,
-header verification, sync, and broadcast transport are built in Lean.
+policy-checked model rather than a transport implementation.
 
 ## Keystore
 
 `LeanKohaku.Keystore.Enclave` models local-only enclave-backed key custody.
-The wallet API is intentionally narrow: create a key, read a public key,
-sign a digest, or delete a key. Secret import/export is denied by the
-accepted policy. Online keystore services are not part of the model.
+Secret import/export is denied by the accepted policy. Native macOS/iOS
+Secure Enclave support is modeled for P-256/R1. Linux TPM, FIDO2, Apple
+Secure Enclave, and external hardware signers are local-only P-256/R1
+custody options.
 
-Native macOS/iOS Secure Enclave support is modeled for P-256/R1. Linux TPM,
-FIDO2, Apple Secure Enclave, and external hardware signers are local-only
-P-256/R1 custody options. Ethereum mainnet is the production target; Sepolia
-is available for dev/testnet hardware-signing flows. Account logic verifies
-R1 signatures through EIP-7951 `P256VERIFY`; this is not an EOA
-secp256k1-key model.
-
-`LeanKohaku.Keystore.Linux` keeps Linux-specific hardware selection out of
-the generic enclave model. It prefers TPM2 for common HP business
+`LeanKohaku.Keystore.Linux` prefers TPM2 for common HP business
 notebooks/workstations and Lenovo ThinkPad/ThinkCentre profiles, falls back
 to FIDO2 security keys when TPM2 is absent, and treats the Linux kernel
 keyring as a local handle store.
 
-`LeanKohaku.Keystore.Tpm2Runtime` is the local Linux runtime boundary. The
-Sepolia dev command:
-
-```bash
-./.lake/build/bin/leankohaku wallet create sepolia
-```
-
-uses local `tpm2-tools` to create a TPM-wrapped P-256 key under
-`.leankohaku/keystore/tpm2/sepolia-r1/`, writes `public.pem` and
-`manifest.txt`, and refuses to overwrite an existing manifest. The generated
-`key.priv` file is a TPM-wrapped private blob, not a raw private key. New
-key creation is gated by local `fprintd-verify`; this is a local biometric
-check, not yet a TPM policy session bound to the key.
-
-Multiple Sepolia dev account keys can coexist by using named slots:
-
-```bash
-./.lake/build/bin/leankohaku wallet create sepolia daily
-./.lake/build/bin/leankohaku wallet create sepolia savings
-./.lake/build/bin/leankohaku wallet list sepolia
-```
-
-Key names are restricted to letters, numbers, `-`, and `_` to prevent path
-traversal. Signing also requires `fprintd-verify` before invoking
-`tpm2_sign`:
-
-```bash
-./.lake/build/bin/leankohaku wallet sign sepolia daily 0x<32-byte-digest>
-```
+`LeanKohaku.Keystore.Tpm2Runtime` is the local Linux runtime boundary.
+It uses local `tpm2-tools` to create TPM-wrapped P-256 keys under
+`.leankohaku/keystore/tpm2/<name>/`, writes `public.pem` and `manifest.txt`,
+and refuses to overwrite an existing manifest. Key creation and signing are
+gated by local `fprintd-verify`.
 
 Nix and Arch packaging list `tpm2-tools`, `libfido2`, and `fprintd` only as
 optional host-integration tools. The Lean wallet does not link to those
@@ -196,28 +203,17 @@ libraries or trust them as crypto implementations.
 
 ## Accounts
 
-`LeanKohaku.Wallet.Account` defines the supported CLI account families:
-
-- `eoaK1`: regular BIP-39/BIP-32 Ethereum EOA with k1 signing, default
-  path `m/44'/60'/0'/0/0`.
-- `r1Smart`: local hardware-backed P-256/R1 account intended to verify via
-  EIP-7951 `P256VERIFY`.
-
-Mainnet policies are the defaults. Sepolia policies are available for
-explicit dev/testnet use. All account policies remain local custody only.
+`LeanKohaku.Wallet.Account` defines regular BIP-39/BIP-32 Ethereum EOAs and
+local hardware-backed P-256/R1 smart accounts. Mainnet policies are the
+defaults; Sepolia policies are available for explicit dev/testnet use.
 
 ## R1 Account
 
 `LeanKohaku.Contract.R1Account` is the Lean-level account verifier model:
-it stores the P-256 public key, enforces a supported chain id
-(`1` mainnet or `11155111` Sepolia),
-checks nonce equality, constructs the EIP-7951 `h || r || s || qx || qy`
-precompile input, and increments nonce only after successful verification.
-
-Verity is the intended path for compiling this account logic directly from
-Lean once dependency/toolchain compatibility is handled. The current repo
-keeps the contract behavior as a pure Lean model with proved invariants,
-instead of adding Solidity.
+it stores the P-256 public key, enforces a supported chain id (`1` mainnet
+or `11155111` Sepolia), checks nonce equality, constructs the EIP-7951
+`h || r || s || qx || qy` precompile input, and increments nonce only after
+successful verification.
 
 ## Invariants
 
@@ -230,10 +226,13 @@ See [`INVARIANTS.md`](./INVARIANTS.md). The current proved inventory:
 | 2.1 | EIP-1559 fee relation | ✅ (by definition) |
 | 2.3 | Chain-ID match | ✅ (by definition) |
 | 4.3 | Account policies are supported-chain/local-only | ✅ |
+| 5.9 | CLI wallet actions preflight only through local daemon | ✅ |
+| 5.10 | Daemon action plans stay inside modeled provider operations | ✅ |
+| 5.11 | Endpoint hygiene rejects credentialed and third-party endpoints | ✅ |
 | 6.1 | CLI only talks to local daemon | ✅ |
-| 6.2 | Daemon never talks to third-party APIs | ✅ |
-| 6.3 | Strict configured-node access is broadcast-only | ✅ |
-| 6.4 | Tor configured-node access must use Tor transport | ✅ |
+| 6.2 | Daemon policies never allow third-party API peers | ✅ |
+| 6.3 | Strict mode denies configured-node access | ✅ |
+| 6.4 | Third-party purposes are denied; Tor configured-node access must use Tor transport | ✅ |
 | 7.1 | Provider non-broadcast methods are reads | ✅ |
 | 7.2 | Default mainnet Helios log bypass disabled | ✅ |
 | 7.3 | Tor provider access is transport-scoped | ✅ |

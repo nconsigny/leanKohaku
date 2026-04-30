@@ -4,8 +4,8 @@ import LeanKohaku.Privacy.NetworkPolicy
 # Daemon server
 
 Long-running process that exposes wallet operations over a local socket.
-The daemon is the only component allowed to perform Ethereum node I/O,
-and every attempted connection must pass `Privacy.NetworkPolicy`.
+The daemon is the only component allowed to perform Ethereum node I/O, and
+every attempted connection must pass `Privacy.NetworkPolicy`.
 -/
 
 namespace LeanKohaku.Daemon.Server

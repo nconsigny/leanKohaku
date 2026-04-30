@@ -6,9 +6,9 @@ import LeanKohaku.Privacy.NetworkPolicy
 Minimal client for talking to Ethereum nodes. JSON parsing/serialization
 stays in Lean to keep the "everything in Lean" promise.
 
-Network I/O must be mediated by `LeanKohaku.Privacy.NetworkPolicy`.
-The CLI must never call this module directly; the daemon may only use it
-for local-node reads and strictly necessary transaction broadcasts.
+Transport code must be mediated by `LeanKohaku.Privacy.NetworkPolicy`.
+The CLI must never call this module directly. The daemon may use it only
+for local/light-client reads and strictly necessary transaction broadcast.
 -/
 
 namespace LeanKohaku.RPC.JsonRpc
@@ -27,7 +27,7 @@ structure Response where
   error  : Option String
   deriving Repr
 
-/-- Classify an Ethereum JSON-RPC call before any transport code can send it. -/
+/-- Classify an Ethereum JSON-RPC method before transport code can send it. -/
 def purposeForMethod (method : String) : Purpose :=
   if method = "eth_sendRawTransaction" then
     Purpose.broadcastTx

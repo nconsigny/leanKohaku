@@ -1,15 +1,13 @@
 /-!
 # Network privacy policy
 
-The CLI and daemon should have an explicit deny-by-default model for all
-network-capable operations. This module classifies every attempted
-connection by peer and purpose before implementation code is allowed to
-perform I/O.
+All network-capable wallet code must classify a request before transport
+code can send it. The policy is deny-by-default: only explicitly modeled
+local daemon, local node, and configured-node traffic can be accepted.
 -/
 
 namespace LeanKohaku.Privacy.NetworkPolicy
 
-/-- The class of peer a process wants to contact. -/
 inductive Peer where
   | localDaemon
   | localNode
@@ -17,7 +15,6 @@ inductive Peer where
   | thirdPartyApi
   deriving DecidableEq, Repr
 
-/-- The reason a process wants to open a connection. -/
 inductive Purpose where
   | daemonControl
   | nodeRead
@@ -26,6 +23,8 @@ inductive Purpose where
   | analytics
   | priceQuote
   | metadataLookup
+  | fiatOnramp
+  | crashReport
   deriving DecidableEq, Repr
 
 inductive Transport where
@@ -35,36 +34,35 @@ inductive Transport where
   deriving DecidableEq, Repr
 
 structure NetworkRequest where
-  peer    : Peer
-  purpose : Purpose
-  transport : Transport := .loopback
-  deriving Repr
+  peer      : Peer
+  purpose   : Purpose
+  transport : Transport
+  deriving Repr, DecidableEq
 
 def Policy := NetworkRequest → Bool
 
-/--
-The CLI must not contact Ethereum nodes or external services directly.
-It may only speak to the local daemon transport.
--/
+/-- CLI code may only speak to the local daemon over local transport. -/
 def strictCliPolicy : Policy
   | { peer := .localDaemon, purpose := .daemonControl, transport := .loopback } => true
   | _ => false
 
 /--
-The daemon may read from a local node and may broadcast only to a local
-node or an explicitly configured node. Third-party APIs, analytics,
-metadata lookups, price feeds, and peer discovery are denied.
+Default daemon policy:
+* local node reads are allowed over loopback;
+* transaction broadcast is allowed to a local node over loopback;
+* configured-node traffic is denied unless Tor mode is explicitly selected;
+* all third-party APIs and metadata-style services are denied.
 -/
 def strictDaemonPolicy : Policy
   | { peer := .localNode, purpose := .nodeRead, transport := .loopback } => true
   | { peer := .localNode, purpose := .broadcastTx, transport := .loopback } => true
-  | { peer := .configuredNode, purpose := .broadcastTx, transport := .direct } => true
-  | { peer := .configuredNode, purpose := .broadcastTx, transport := .tor } => true
   | _ => false
 
 /--
-Tor mode permits read and broadcast access to an explicitly configured node
-only through Tor. Third-party APIs remain denied.
+Tor daemon policy:
+* local node traffic remains loopback-only;
+* configured-node reads and broadcasts may use Tor;
+* direct configured-node reads remain denied.
 -/
 def torDaemonPolicy : Policy
   | { peer := .localNode, purpose := .nodeRead, transport := .loopback } => true
@@ -75,5 +73,75 @@ def torDaemonPolicy : Policy
 
 /-- Deny-by-default helper for future features that have not been classified. -/
 def denyByDefault : Policy := fun _ => false
+
+def thirdPartyPurpose : Purpose → Bool
+  | .peerDiscovery => true
+  | .analytics => true
+  | .priceQuote => true
+  | .metadataLookup => true
+  | .fiatOnramp => true
+  | .crashReport => true
+  | _ => false
+
+def Peer.asString : Peer → String
+  | .localDaemon => "local-daemon"
+  | .localNode => "local-node"
+  | .configuredNode => "configured-node"
+  | .thirdPartyApi => "third-party-api"
+
+def Purpose.asString : Purpose → String
+  | .daemonControl => "daemon-control"
+  | .nodeRead => "node-read"
+  | .broadcastTx => "broadcast-tx"
+  | .peerDiscovery => "peer-discovery"
+  | .analytics => "analytics"
+  | .priceQuote => "price-quote"
+  | .metadataLookup => "metadata-lookup"
+  | .fiatOnramp => "fiat-onramp"
+  | .crashReport => "crash-report"
+
+def Transport.asString : Transport → String
+  | .loopback => "loopback"
+  | .tor => "tor"
+  | .direct => "direct"
+
+def parsePeer : String → Option Peer
+  | "local-daemon" => some .localDaemon
+  | "local-node" => some .localNode
+  | "configured-node" => some .configuredNode
+  | "third-party-api" => some .thirdPartyApi
+  | _ => none
+
+def parsePurpose : String → Option Purpose
+  | "daemon-control" => some .daemonControl
+  | "node-read" => some .nodeRead
+  | "broadcast-tx" => some .broadcastTx
+  | "peer-discovery" => some .peerDiscovery
+  | "analytics" => some .analytics
+  | "price-quote" => some .priceQuote
+  | "metadata-lookup" => some .metadataLookup
+  | "fiat-onramp" => some .fiatOnramp
+  | "crash-report" => some .crashReport
+  | _ => none
+
+def parseTransport : String → Option Transport
+  | "loopback" => some .loopback
+  | "tor" => some .tor
+  | "direct" => some .direct
+  | _ => none
+
+def parsePolicy : String → Option Policy
+  | "cli" => some strictCliPolicy
+  | "strict" => some strictDaemonPolicy
+  | "tor" => some torDaemonPolicy
+  | "deny" => some denyByDefault
+  | _ => none
+
+def policyNames : List String := ["cli", "strict", "tor", "deny"]
+def peerNames : List String := ["local-daemon", "local-node", "configured-node", "third-party-api"]
+def purposeNames : List String :=
+  ["daemon-control", "node-read", "broadcast-tx", "peer-discovery", "analytics",
+    "price-quote", "metadata-lookup", "fiat-onramp", "crash-report"]
+def transportNames : List String := ["loopback", "tor", "direct"]
 
 end LeanKohaku.Privacy.NetworkPolicy
