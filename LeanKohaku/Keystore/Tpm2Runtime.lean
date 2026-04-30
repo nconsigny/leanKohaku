@@ -110,6 +110,12 @@ def signingTools : List String :=
 def biometricTool : String :=
   "fprintd-verify"
 
+def defaultBiometricFinger : String :=
+  "right-index-finger"
+
+def biometricAttempts : Nat :=
+  3
+
 def logStep (msg : String) : IO Unit :=
   IO.println s!"[leankohaku:tpm2] {msg}"
 
@@ -172,22 +178,38 @@ def runChecked (cmd : String) (args : Array String) : IO (Except String String) 
   catch e =>
     pure (.error e.toString)
 
+def biometricFinger : IO String := do
+  match ← IO.getEnv "LEAN_KOHAKU_BIOMETRIC_FINGER" with
+  | some finger =>
+      if finger.isEmpty then
+        pure defaultBiometricFinger
+      else
+        pure finger
+  | none => pure defaultBiometricFinger
+
+partial def verifyLocalUserLoop
+    (finger : String) : Nat → Nat → IO (Except String Unit)
+  | 0, _ =>
+      pure (.error s!"{biometricTool} failed after {biometricAttempts} attempts")
+  | remaining + 1, attemptNo => do
+      logStep s!"starting biometric verification with fprintd using {finger} (attempt {attemptNo}/{biometricAttempts})"
+      IO.println s!"Biometric verification required. Touch {finger} on your fingerprint sensor now."
+      let child ← IO.Process.spawn
+        { cmd := biometricTool,
+          args := #["-f", finger],
+          stdin := .inherit,
+          stdout := .inherit,
+          stderr := .inherit }
+      let exitCode ← child.wait
+      if exitCode == 0 then
+        logStep "biometric verification succeeded"
+        pure (.ok ())
+      else
+        logStep s!"biometric verification failed with exit code {exitCode}"
+        verifyLocalUserLoop finger remaining (attemptNo + 1)
+
 def verifyLocalUser : IO (Except String Unit) := do
-  logStep "starting biometric verification with fprintd"
-  IO.println "Biometric verification required. Touch your fingerprint sensor now."
-  let child ← IO.Process.spawn
-    { cmd := biometricTool,
-      args := #[],
-      stdin := .inherit,
-      stdout := .inherit,
-      stderr := .inherit }
-  let exitCode ← child.wait
-  if exitCode == 0 then
-    logStep "biometric verification succeeded"
-    pure (.ok ())
-  else
-    logStep s!"biometric verification failed with exit code {exitCode}"
-    pure (.error s!"{biometricTool} exited with code {exitCode}")
+  verifyLocalUserLoop (← biometricFinger) biometricAttempts 1
 
 def fileArg (path : System.FilePath) : String :=
   path.toString
@@ -205,6 +227,8 @@ def manifestContents (cfg : Config) : String :=
   "loaded_context=key.ctx\n" ++
   "custody=local-tpm2\n" ++
   "creation_user_verification=fprintd-verify\n" ++
+  s!"creation_user_verification_finger={defaultBiometricFinger}\n" ++
+  s!"creation_user_verification_attempts={biometricAttempts}\n" ++
   "creation_user_verification_tpm_bound=false\n" ++
   "raw_private_key_exported=false\n" ++
   s!"key_name={cfg.keyName}\n"

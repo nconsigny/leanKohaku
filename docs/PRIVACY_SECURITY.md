@@ -45,10 +45,7 @@ defaults, fallbacks, or convenience features:
 
 ## Invariant Modules
 
-- `LeanKohaku.Invariants.NetworkPrivacy`
-- `LeanKohaku.Invariants.CliActions`
-- `LeanKohaku.Invariants.DaemonProtocol`
-- `LeanKohaku.Invariants.Endpoint`
+- `LeanKohaku.Invariants.Network`
 
 These modules prove the current policy boundaries used by the CLI and
 daemon models.

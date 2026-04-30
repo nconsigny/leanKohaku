@@ -12,6 +12,59 @@ Status legend:
 
 ---
 
+## Category 0 — Verified wallet core
+
+### 0.1 No key exfiltration
+The verified core cannot output private-key material because key material is
+not represented in the output type.
+
+**Prop:** `containsPrivateKeyMaterial out = false`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Core.lean::no_key_exfiltration`
+
+### 0.2 No raw signing oracle
+The core signs only verified typed intents, never arbitrary bytes.
+
+**Props:**
+- `verifiedIntent s intent → intent.rawSigning = false`
+- `signIntent s intent kind = ok signature → verifiedIntent s intent`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Core.lean`
+
+### 0.3 No wrong-chain signing
+Verified intents must use a supported chain, match the selected chain, and
+match the observed RPC chain id.
+
+**Props:**
+- `verifiedIntent s intent → supportedChainId intent.chainId = true`
+- `verifiedIntent s intent → intent.chainId = s.selectedChain`
+- `verifiedIntent s intent → intent.rpcChainId = some intent.chainId`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Core.lean`
+
+### 0.4 Approval and signer path correspondence
+Signatures require user approval, and R1/EOA paths cannot silently substitute
+for each other.
+
+**Props:**
+- `verifiedIntent s intent → intent.approved = true`
+- `verifiedIntent s intent → intent.keyRef.kind = intent.signerKind`
+- `SignEOA` outputs secp256k1 signatures
+- `SignR1` outputs P-256 signatures
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Core.lean`
+
+### 0.5 R1 TPM policy and EIP-7702 guardrails
+R1 signing requires an explicit satisfied TPM policy. EIP-7702-style intents
+require explicit delegation approval and cannot use global chain id `0`.
+
+**Props:**
+- `verifiedIntent s intent → intent.signerKind = r1 → ∃ policy, intent.tpmPolicy = some policy ∧ policy.satisfied = true`
+- `verifiedIntent s intent → intent.is7702 = true → intent.delegateApproved = true ∧ intent.chainId ≠ 0`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Core.lean`
+
+---
+
 ## Category 1 — Amount arithmetic
 
 ### 1.1 Checked subtraction never underflows
@@ -95,8 +148,8 @@ Ethereum P256VERIFY precompile model.
 ### 4.1 RLP roundtrip
 Every RLP item decodes back to itself after encoding.
 
-**Prop:** `∀ i : Rlp.Item, Rlp.decode (Rlp.encode i) = some (i, ByteArray.empty)`
-**Status:** 📝 stated — `LeanKohaku/Encoding/Rlp.lean`
+**Prop:** TBD once the RLP module is reintroduced
+**Status:** 📝 stated — future encoding module
 
 ### 4.2 Hex roundtrip
 `decode ∘ encode = some` on byte arrays.
@@ -147,7 +200,7 @@ services.
 - `preflight strictCliPolicy action = true → strictCliPolicy (daemonRequest action) = true`
 - `parseSend to amount = some action → ∃ n, action = send to n ∧ n > 0`
 
-**Status:** ✅ proved — `LeanKohaku/Invariants/CliActions.lean`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean`
 
 ### 5.10 Daemon action plans stay inside modeled provider operations
 The daemon maps `balance` to `eth_getBalance` and `send` to
@@ -160,7 +213,7 @@ Tor plans use configured-node Tor transport.
 - `strictPermitted req = true`
 - `torPermitted req = true`
 
-**Status:** ✅ proved — `LeanKohaku/Invariants/DaemonProtocol.lean`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean`
 
 ### 5.11 Endpoint hygiene rejects credentialed and third-party endpoints
 Endpoint policy is separate from request policy so hosted APIs and hidden
@@ -172,7 +225,7 @@ API-key dependencies can be rejected before transport code exists.
 - `acceptedStrict ep = true → ep.kind = local ∧ ep.transport = loopback`
 - `acceptedTor ep = true → ep.kind ≠ thirdParty`
 
-**Status:** ✅ proved — `LeanKohaku/Invariants/Endpoint.lean`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean`
 
 ---
 
@@ -183,7 +236,7 @@ The CLI must not contact Ethereum nodes or external services directly. It
 may only use local daemon control over loopback.
 
 **Prop:** `strictCliPolicy req = true → req.peer = localDaemon ∧ req.purpose = daemonControl ∧ req.transport = loopback`
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictCli_onlyLocalDaemon`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean::strictCli_onlyLocalDaemon`
 
 ### 6.2 Daemon policies never allow third-party API peers
 The daemon is the only component allowed to perform node I/O, but strict
@@ -193,7 +246,7 @@ and Tor policies reject third-party API peers.
 - `strictDaemonPolicy req = true → req.peer ≠ thirdPartyApi`
 - `torDaemonPolicy req = true → req.peer ≠ thirdPartyApi`
 
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean`
 
 ### 6.3 Strict mode denies configured-node access
 Under strict policy, configured-node access is denied entirely. Remote
@@ -203,14 +256,14 @@ configured-node access requires the explicit Tor policy.
 - `strictDaemonPolicy req = true → req.peer ≠ configuredNode`
 - `permitted strictDaemonPolicy cfg op = true → cfg.backend ≠ configuredNode`
 
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean`
 
 ### 6.4 Third-party purposes are denied
 Analytics, price quotes, metadata/indexer lookup, fiat/onramp calls, crash
 reports, and discovery are not wallet-network purposes.
 
 **Prop:** `thirdPartyPurpose req.purpose = true → strictDaemonPolicy req = false`
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::deniedThirdPartyPurposesStrict`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean::deniedThirdPartyPurposesStrict`
 
 ### 6.5 Tor configured-node access is Tor-only
 When configured-node access is enabled via Tor policy, it must use Tor
@@ -220,67 +273,33 @@ transport.
 - `torDaemonPolicy req = true → req.peer = configuredNode → req.transport = tor`
 - `permitted torDaemonPolicy cfg op = true → cfg.backend = configuredNode → cfg.transport = tor`
 
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean`
 
 ---
 
-## Category 6 — Network privacy
-
-### 6.1 CLI only talks to the local daemon
-The CLI must not contact Ethereum nodes, third-party APIs, analytics,
-price feeds, metadata services, or discovery services. It may only use
-the local daemon control channel.
-
-**Prop:** `strictCliPolicy req = true → req.peer = localDaemon ∧ req.purpose = daemonControl ∧ req.transport = loopback`
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictCli_onlyLocalDaemon`
-
-### 6.2 Daemon never talks to third-party APIs
-The daemon is the only component allowed to perform node I/O, but strict
-daemon policy rejects all third-party API peers.
-
-**Prop:** `strictDaemonPolicy req = true → req.peer ≠ thirdPartyApi`
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictDaemon_neverThirdParty`
-
-### 6.3 Configured-node access is broadcast-only
-Read queries should stay local/light-client oriented. If the strict policy
-allows a configured remote node, it must be for transaction broadcast only.
-
-**Prop:** `strictDaemonPolicy req = true → req.peer = configuredNode → req.purpose = broadcastTx`
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictDaemon_configuredNodeOnlyBroadcast`
-
-### 6.4 Tor configured-node access must use Tor transport
-Cake Wallet's Tor/proxy model is useful, but leanKohaku keeps it explicit:
-Tor mode may use a configured node for reads or broadcasts only when the
-transport is Tor. Third-party APIs remain denied.
-
-**Prop:** `torDaemonPolicy req = true → req.peer = configuredNode → req.transport = tor`
-**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::torDaemon_configuredNodeOnlyTor`
-
----
-
-## Category 7 — Light-client provider
+## Category 7 — Provider policy
 
 ### 7.1 Provider non-broadcast methods are reads
-The Kohaku-style provider surface classifies read-only methods separately
-from `eth_sendRawTransaction`, so future transport code can deny broad
-remote querying and permit only strictly necessary broadcasts.
+The provider surface classifies read-only methods separately from
+`eth_sendRawTransaction`, so transport code can deny broad remote querying
+and permit only strictly necessary broadcasts.
 
 **Prop:** `m ≠ sendRawTransaction → m.purpose = nodeRead`
-**Status:** ✅ proved — `LeanKohaku/Invariants/LightClient.lean::nonBroadcastMethodsAreReads`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean::nonBroadcastMethodsAreReads`
 
-### 7.2 Default mainnet Helios log bypass disabled
-Upstream Kohaku's Helios wrapper has an optional `eth_getLogs` execution-RPC
-bypass. leanKohaku models this explicitly and disables it by default.
+### 7.2 Strict mode denies configured providers
+Strict mode keeps reads and broadcasts local. Configured-node access is
+available only through the explicit Tor policy.
 
-**Prop:** `permittedLogBypass strictDaemonPolicy Config.defaultMainnet = false`
-**Status:** ✅ proved — `LeanKohaku/Invariants/LightClient.lean::defaultMainnetLogBypassDisabled`
+**Prop:** `permitted strictDaemonPolicy cfg op = true → cfg.backend ≠ configuredNode`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean::strictConfiguredProviderDenied`
 
 ### 7.3 Tor provider access is transport-scoped
 When the provider model is evaluated under Tor daemon policy, any allowed
 configured-node access must be classified as Tor transport.
 
-**Prop:** `permitted torDaemonPolicy cfg op = true → (requestFor cfg op).peer = configuredNode → (requestFor cfg op).transport = tor`
-**Status:** ✅ proved — `LeanKohaku/Invariants/LightClient.lean::torPolicyConfiguredPeerOnlyTor`
+**Prop:** `permitted torDaemonPolicy cfg op = true → cfg.backend = configuredNode → cfg.transport = tor`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Network.lean::torConfiguredProviderOnlyTor`
 
 ---
 

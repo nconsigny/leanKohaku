@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`leanKohaku` is a formally-verified Ethereum wallet daemon written entirely in **Lean 4** (pinned to `leanprover/lean4:v4.29.1` via `lean-toolchain`). It is a ground-up re-architecture of the TypeScript [`kohaku-ai`](https://github.com/jiayaoqijia/kohaku-ai) project; no runtime code is shared. The CLI-first surface talks to a long-running daemon over a Unix domain socket. Everything (secp256k1, Keccak, RLP, BIP32/39, JSON-RPC) is implemented in Lean — no FFI to external crypto — so the signing path can be reasoned about in the same type system.
+`leanKohaku` is a formally-verified Ethereum wallet daemon written entirely in **Lean 4** (pinned to `leanprover/lean4:v4.29.1` via `lean-toolchain`). It is a ground-up re-architecture of the TypeScript [`kohaku-ai`](https://github.com/jiayaoqijia/kohaku-ai) project; no runtime code is shared. The CLI-first surface talks to a long-running daemon over a Unix domain socket. The current critical path models network policy, local TPM custody, P-256/R1 account verification, and Sepolia dev execution in Lean, while avoiding FFI crypto in wallet logic.
 
 ## Build & run
 
@@ -29,9 +29,9 @@ Lake options set repo-wide: `autoImplicit := false` (every type variable must be
 
 Three-layer structure; dependency flows downward and the `Invariants` tree is where proved properties live alongside the abstract models they constrain.
 
-1. **Primitives** — `LeanKohaku/Crypto/` (Hex, Keccak, Sha256/512, Secp256k1), `LeanKohaku/Encoding/Rlp.lean`. Pure, no IO.
-2. **Domain** — `LeanKohaku/Ethereum/` (Address, Chain, Tx), `LeanKohaku/Wallet/` (BIP39 Mnemonic, BIP32 HDKey). Builds on primitives.
-3. **Surfaces** — `LeanKohaku/RPC/JsonRpc.lean`, `LeanKohaku/Daemon/Server.lean`, `LeanKohaku/Cli/Commands.lean`. The CLI parses argv to a `Command` ADT; `daemon` delegates to `Daemon.Server.run`. The daemon is currently a stub — `run` just prints a not-implemented line.
+1. **Primitives** — `LeanKohaku/Crypto/` (Hex, Secp256k1 scaffolding). Pure, no IO.
+2. **Domain** — `LeanKohaku/Ethereum/`, `LeanKohaku/Wallet/`, `LeanKohaku/Keystore/`, `LeanKohaku/Contract/`. Runtime TPM2 integration is isolated in `Keystore/Tpm2Runtime.lean`.
+3. **Surfaces** — `LeanKohaku/RPC/JsonRpc.lean`, `LeanKohaku/Daemon/Server.lean`, `LeanKohaku/Cli/Commands.lean`. The CLI parses argv to a `Command` ADT; `daemon` delegates to `Daemon.Server.run` or local wallet helpers. The daemon server is still a stub.
 
 `LeanKohaku.lean` is import-only and re-exports every module, so downstream code writes `import LeanKohaku`.
 

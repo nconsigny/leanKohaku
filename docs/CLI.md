@@ -39,6 +39,17 @@ They currently exit with code `1` after successful preflight because daemon
 transport is not implemented. Invalid inputs exit with code `2` before any
 daemon or network path is attempted.
 
+Daemon wallet send:
+
+```bash
+leankohaku daemon help
+leankohaku daemon daily send sepolia 0xAa651C04bfE4F302eE243D6638d3B91389C4C02C 0.002
+```
+
+This is the preferred user-facing send path. It takes ETH units, computes
+the R1 account digest, requires local TPM/fingerprint signing, and then
+broadcasts the R1 account `execute` transaction on Sepolia.
+
 ## Regression Check
 
 ```bash

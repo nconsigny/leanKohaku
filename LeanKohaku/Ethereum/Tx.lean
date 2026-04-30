@@ -5,7 +5,8 @@ import LeanKohaku.Crypto.Secp256k1
 # Ethereum transactions
 
 Type-2 (EIP-1559) transactions only to start. We model them at the
-abstract level first, then RLP-encode once `Encoding.Rlp` is complete.
+abstract level first; byte-level transaction encoding will be reintroduced
+when it is needed by a production signing path.
 -/
 
 namespace LeanKohaku.Ethereum.Tx

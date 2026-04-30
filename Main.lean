@@ -1,13 +1,11 @@
 import LeanKohaku
 
 open LeanKohaku.Cli.Commands
-open LeanKohaku.Cli.Actions
-open LeanKohaku.Daemon.Protocol
 open LeanKohaku.Privacy.NetworkPolicy
 
 def printPreflight (action : Action) : IO UInt32 := do
   if preflight strictCliPolicy action then
-    let daemonReq : Request := { action }
+    let daemonReq : DaemonRequest := { action }
     let plan := strictPlan daemonReq
     IO.println s!"preflight OK: {actionSummary action}"
     IO.println "network: local-daemon daemon-control loopback"
@@ -111,6 +109,30 @@ def runSepoliaWalletSign (keyName : String) (digestHex : String) : IO UInt32 := 
   IO.println (tpm2SignReportText report)
   return report.status.exitCode
 
+def runScript (args : Array String) (env : Array (String × Option String) := #[]) : IO UInt32 := do
+  let child ← IO.Process.spawn
+    { cmd := "./script/r1_sepolia.sh",
+      args := args,
+      env := env,
+      stdin := .inherit,
+      stdout := .inherit,
+      stderr := .inherit }
+  child.wait
+
+def runSepoliaWalletSend (keyName to amountWei : String) : IO UInt32 := do
+  runScript #["send", to, amountWei] #[("LEAN_KOHAKU_TPM_KEY", some keyName)]
+
+def runDaemonWalletSend (walletName chain to amountEth : String) : IO UInt32 := do
+  match chain with
+  | "sepolia" =>
+      runScript #["send-eth", to, amountEth] #[("LEAN_KOHAKU_TPM_KEY", some walletName)]
+  | "mainnet" =>
+      IO.eprintln "mainnet R1 send is not enabled yet; deploy and verify the account path on Sepolia first"
+      return 2
+  | _ =>
+      IO.eprintln s!"unsupported chain: {chain} (expected sepolia or mainnet)"
+      return 2
+
 end LeanKohaku.Cli
 
 def main (args : List String) : IO UInt32 := do
@@ -124,6 +146,7 @@ def main (args : List String) : IO UInt32 := do
   | .walletCreateSepolia keyName => LeanKohaku.Cli.runSepoliaWalletCreate keyName
   | .walletListSepolia => LeanKohaku.Cli.runSepoliaWalletList
   | .walletSignSepolia keyName digestHex => LeanKohaku.Cli.runSepoliaWalletSign keyName digestHex
+  | .walletSendSepolia keyName to amountWei => LeanKohaku.Cli.runSepoliaWalletSend keyName to amountWei
   | .network    => IO.println networkText; return 0
   | .security   => IO.println securityText; return 0
   | .doctor     => IO.println doctorText; return 0
@@ -137,6 +160,11 @@ def main (args : List String) : IO UInt32 := do
   | .endpointCheck mode kind scheme transport credentialed =>
       IO.println (endpointCheckText mode kind scheme transport credentialed)
       return 0
+  | .daemonHelp walletName? =>
+      IO.println (daemonHelpText walletName?)
+      return 0
+  | .daemonWalletSend walletName chain to amountEth =>
+      LeanKohaku.Cli.runDaemonWalletSend walletName chain to amountEth
   | .daemon     =>
       LeanKohaku.Daemon.Server.run LeanKohaku.Daemon.Server.defaultConfig
       return 0

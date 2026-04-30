@@ -1,5 +1,6 @@
-import LeanKohaku.Network.Provider
+import LeanKohaku.Crypto.Hex
 import LeanKohaku.Network.Endpoint
+import LeanKohaku.Network.Provider
 
 /-!
 # CLI commands
@@ -12,8 +13,108 @@ fast with a clear error.
 namespace LeanKohaku.Cli.Commands
 
 open LeanKohaku.Privacy.NetworkPolicy
+open LeanKohaku.Crypto
 open LeanKohaku.Network.Provider
 open LeanKohaku.Network.Endpoint
+
+/-! ## Input validation and local daemon preflight -/
+
+def strip0x : String → String
+  | s =>
+      match s.toList with
+      | '0' :: 'x' :: rest => String.ofList rest
+      | '0' :: 'X' :: rest => String.ofList rest
+      | _ => s
+
+def allHexChars : List Char → Bool
+  | [] => true
+  | c :: cs =>
+      match Hex.hexDigit? c with
+      | some _ => allHexChars cs
+      | none => false
+
+def validAddressString (s : String) : Bool :=
+  let raw := strip0x s
+  raw.toList.length = 40 && allHexChars raw.toList
+
+def parsePositiveNat (s : String) : Option Nat :=
+  match s.toNat? with
+  | some n => if n > 0 then some n else none
+  | none => none
+
+theorem parsePositiveNat_some_positive {s : String} {n : Nat} :
+    parsePositiveNat s = some n → n > 0 := by
+  intro h
+  unfold parsePositiveNat at h
+  cases hs : s.toNat? with
+  | none =>
+      simp [hs] at h
+  | some parsed =>
+      by_cases hp : parsed > 0
+      · simp [hs, hp] at h
+        subst h
+        exact hp
+      · simp [hs, hp] at h
+
+inductive Action where
+  | balance (address : String)
+  | send (to : String) (amountWei : Nat)
+  deriving Repr, DecidableEq
+
+def Action.valid : Action → Bool
+  | .balance address => validAddressString address
+  | .send to amountWei => validAddressString to && amountWei > 0
+
+def daemonRequest (_action : Action) : NetworkRequest :=
+  { peer := .localDaemon, purpose := .daemonControl, transport := .loopback }
+
+def preflight (policy : Policy) (action : Action) : Bool :=
+  action.valid && policy (daemonRequest action)
+
+def parseBalance (address : String) : Option Action :=
+  let action := Action.balance address
+  if action.valid then some action else none
+
+def parseSend (to amount : String) : Option Action := do
+  let amountWei ← parsePositiveNat amount
+  let action := Action.send to amountWei
+  if action.valid then some action else none
+
+def actionSummary : Action → String
+  | .balance address => s!"balance address={address}"
+  | .send to amountWei => s!"send to={to} amountWei={amountWei}"
+
+structure DaemonRequest where
+  action : Action
+  deriving Repr, DecidableEq
+
+inductive Plan where
+  | provider (cfg : Config) (op : Operation)
+  deriving Repr, DecidableEq
+
+def providerOperation : Action → Operation
+  | .balance _ => { method := .getBalance }
+  | .send _ _ => { method := .sendRawTransaction }
+
+def strictPlan (req : DaemonRequest) : Plan :=
+  .provider Config.local (providerOperation req.action)
+
+def torPlan (req : DaemonRequest) : Plan :=
+  .provider Config.torConfigured (providerOperation req.action)
+
+def planPermitted (policy : Policy) : Plan → Bool
+  | .provider cfg op => permitted policy cfg op
+
+def strictPermitted (req : DaemonRequest) : Bool :=
+  planPermitted strictDaemonPolicy (strictPlan req)
+
+def torPermitted (req : DaemonRequest) : Bool :=
+  planPermitted torDaemonPolicy (torPlan req)
+
+def planSummary : Plan → String
+  | .provider cfg op =>
+      let req := requestFor cfg op
+      s!"backend={cfg.backend.asString} method={op.method.asString} peer={req.peer.asString} purpose={req.purpose.asString} transport={req.transport.asString}"
 
 inductive Command where
   | help
@@ -25,6 +126,7 @@ inductive Command where
   | walletCreateSepolia (keyName : String)
   | walletListSepolia
   | walletSignSepolia (keyName : String) (digestHex : String)
+  | walletSendSepolia (keyName : String) (to : String) (amountWei : String)
   | network
   | security
   | doctor
@@ -32,6 +134,8 @@ inductive Command where
   | rpcCheck (policy backend transport method : String)
   | rpcMethods
   | endpointCheck (mode kind scheme transport credentialed : String)
+  | daemonHelp (walletName : Option String)
+  | daemonWalletSend (walletName chain to amountEth : String)
   | daemon      -- run the daemon (same as `leankohaku-daemon`)
   | balance (address : String)
   | send (to : String) (amount : String)
@@ -56,6 +160,8 @@ def parse : List String → Command
   | ["wallet", "list", "sepolia"] => .walletListSepolia
   | ["wallet", "sign", "sepolia", digestHex] => .walletSignSepolia "sepolia-r1" digestHex
   | ["wallet", "sign", "sepolia", keyName, digestHex] => .walletSignSepolia keyName digestHex
+  | ["wallet", "send", "sepolia", to, amountWei] => .walletSendSepolia "sepolia-r1" to amountWei
+  | ["wallet", "send", "sepolia", keyName, to, amountWei] => .walletSendSepolia keyName to amountWei
   | ["network"]           => .network
   | ["security"]          => .security
   | ["doctor"]            => .doctor
@@ -66,6 +172,10 @@ def parse : List String → Command
   | ["rpc-methods"]       => .rpcMethods
   | ["endpoint-check", mode, kind, scheme, transport, credentialed] =>
       .endpointCheck mode kind scheme transport credentialed
+  | ["daemon", "help"] => .daemonHelp none
+  | ["daemon", walletName, "help"] => .daemonHelp (some walletName)
+  | ["daemon", walletName, "send", chain, to, amountEth] =>
+      .daemonWalletSend walletName chain to amountEth
   | ["daemon"]            => .daemon
   | ["balance", addr]     => .balance addr
   | ["send", to, amount]  => .send to amount
@@ -184,19 +294,50 @@ def doctorText : String :=
      lake build\n\
      ./script/check_privacy_cli.sh\n"
 
+def daemonHelpText (walletName? : Option String) : String :=
+  let walletName := walletName?.getD "<wallet>"
+  "leanKohaku daemon wallet commands\n\n\
+   Primary command shape:\n\
+     leankohaku daemon <wallet> send <chain> <to> <eth>\n\n\
+   Example:\n\
+     leankohaku daemon " ++ walletName ++ " send sepolia 0xAa651C04bfE4F302eE243D6638d3B91389C4C02C 0.002\n\n\
+   Arguments:\n\
+     <wallet>  Local TPM key slot name, for example daily or sepolia-r1\n\
+     <chain>   sepolia today; mainnet is intentionally disabled until production R1 deployment\n\
+     <to>      20-byte Ethereum address, 0x-prefixed\n\
+     <eth>     Human ETH amount, for example 0, 0.001, or 0.002\n\n\
+   What happens on Sepolia:\n\
+     1. Read the deployed R1 account address for the wallet key\n\
+     2. Convert ETH to wei locally with cast\n\
+     3. Ask the R1 account for the operation digest\n\
+     4. Require fprintd biometric verification, default right-index-finger, up to 3 tries\n\
+     5. Sign the digest with the local TPM P-256 key\n\
+     6. Broadcast execute(...) through the deployed R1 account\n\n\
+   Setup commands:\n\
+     leankohaku wallet create sepolia " ++ walletName ++ "\n\
+     LEAN_KOHAKU_TPM_KEY=" ++ walletName ++ " ./script/r1_sepolia.sh deploy\n\n\
+   Inspect:\n\
+     leankohaku wallet list sepolia\n\
+     ./script/r1_sepolia.sh address\n\n\
+   Safety notes:\n\
+     - The TPM private blob stays local under .leankohaku/ and is gitignored\n\
+     - Fingerprint verification gates signing but is not yet a TPM policy session\n\
+     - The current Sepolia contract is a temporary Solidity fallback\n\
+     - Contracts/R1Account/ remains the Lean/Verity source of truth\n"
+
 def lightclientText : String :=
-  "leanKohaku light-client plan\n\n\
+  "leanKohaku provider policy plan\n\n\
    Provider model:\n\
-     - mirrors @kohaku-eth/provider's raw/Helios provider boundary\n\
      - represents provider operations as Lean data before transport exists\n\
-     - treats Helios-style reads as local light-client reads\n\
+     - classifies methods by peer, purpose, and transport\n\
+     - treats local node and future light-client reads as local policy paths\n\
      - separates transaction broadcast from read-only chain queries\n\n\
    Privacy constraints:\n\
      - no third-party APIs for discovery, metadata, analytics, or prices\n\
      - no direct CLI node calls; the daemon owns provider access\n\
      - Tor mode may read and broadcast through a configured node over Tor\n\
-     - eth_getLogs bypass is disabled by default and must remain policy-gated\n\n\
-   See LeanKohaku.LightClient.Provider and LeanKohaku.Invariants.LightClient.\n"
+     - configured-node access requires explicit Tor policy\n\n\
+   See LeanKohaku.Network.Provider and LeanKohaku.Invariants.Network.\n"
 
 def keystoreText : String :=
   "leanKohaku local keystore policy\n\n\
@@ -237,35 +378,25 @@ def helpText : String :=
   "leankohaku — formally-verified Ethereum wallet (Lean 4)\n\n\
    USAGE:\n\
      leankohaku <command> [args]\n\n\
-   COMMANDS:\n\
-     help                      Show this help\n\
-     version                   Print version\n\
-     privacy                   Print privacy policy\n\
-     lightclient               Print the light-client provider policy\n\
-     keystore                  Print the enclave keystore policy\n\
-     accounts                  Print supported account policies\n\
-     wallet create sepolia     Start the Sepolia R1 wallet creation flow\n\
-     wallet create sepolia <name>\n\
-                               Create an additional named TPM2 key slot\n\
-     wallet create sepolia r1-smart\n\
-                               Same as above, explicit account family\n\
-     wallet list sepolia       List local Sepolia TPM2 key slots\n\
-     wallet sign sepolia <digest>\n\
-                               Sign a 32-byte hex digest with the default key\n\
-     wallet sign sepolia <name> <digest>\n\
-                               Sign with a named TPM2 key slot\n\
-     network                   Print network surface policy\n\
-     security                  Print strict security posture\n\
-     doctor                    Print implementation/check status\n\
+   MAIN COMMANDS:\n\
+     daemon help                         Detailed wallet daemon help\n\
+     daemon <wallet> send <chain> <to> <eth>\n\
+                                         Send from a named TPM/R1 wallet\n\
+     daemon                              Start the daemon process\n\n\
+   SETUP / INSPECT:\n\
+     wallet create sepolia <wallet>      Create a local TPM-backed Sepolia key\n\
+     wallet list sepolia                 List local TPM-backed Sepolia keys\n\
+     doctor                              Print implementation/check status\n\n\
+   POLICY / DEBUG:\n\
+     privacy | network | security | rpc-methods\n\
      policy-check <policy> <peer> <purpose> <transport>\n\
-                               Evaluate a raw network policy request\n\
      rpc-check <policy> <backend> <transport> <method>\n\
-                               Evaluate a modeled JSON-RPC request\n\
-     rpc-methods               List modeled JSON-RPC methods\n\
-     endpoint-check <mode> <kind> <scheme> <transport> <credentialed>\n\
-                               Evaluate endpoint hygiene policy\n\
-     daemon                    Start the wallet daemon\n\
-     balance <address>         Fetch balance via the daemon\n\
-     send <to> <amount>        Send ETH via the daemon (prompts for confirm)\n"
+     endpoint-check <mode> <kind> <scheme> <transport> <credentialed>\n\n\
+   LOW-LEVEL COMPATIBILITY:\n\
+     wallet sign sepolia <wallet> <digest>\n\
+     wallet send sepolia <wallet> <to> <wei>\n\
+     balance <address>\n\
+     send <to> <amountWei>\n\n\
+   Run `leankohaku daemon help` for the documented send flow.\n"
 
 end LeanKohaku.Cli.Commands

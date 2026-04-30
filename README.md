@@ -11,10 +11,10 @@ critical signing path.
 
 - **CLI-first.** The primary interface is a local command-line tool that
   talks to a long-running daemon over a Unix domain socket.
-- **Full Lean.** No FFI to Rust/JS crypto libraries. Keccak, RLP,
-  BIP32/39, JSON-RPC, secp256k1 scaffolding, and P-256 precompile
-  modeling live in Lean so the critical path can be reasoned about inside
-  the same type system.
+- **Full Lean.** No FFI to Rust/JS crypto libraries in the wallet path.
+  Hex parsing, network policy, account policy, TPM custody, and P-256
+  precompile modeling live in Lean so the critical path can be reasoned
+  about inside the same type system.
 - **Iteratively verified.** We do not aim for 100% proof coverage on day
   one. Instead we grow `INVARIANTS.md` alongside the code, and elevate
   each invariant from 📝 (stated) → 🚧 (in progress) → ✅ (proved).
@@ -38,9 +38,8 @@ critical signing path.
   and hardware-signing tests.
 - **Two account families.** The CLI models regular BIP-39/BIP-32 Ethereum
   EOAs with k1 signing and local hardware-backed R1 smart accounts.
-- **Light-client oriented.** The provider boundary is modeled after
-  `@kohaku-eth/provider`, especially its raw/Helios split, while keeping
-  runtime code in Lean and policy-gating every network-capable operation.
+- **Provider-policy oriented.** Provider operations are modeled as data and
+  policy-gated before transport exists.
 - **Shielded privacy later.** Railgun-style shielded-note semantics are a
   late-stage target built on top of the stricter network posture.
 
@@ -62,15 +61,13 @@ leanKohaku/
 ├─ LeanKohaku.lean                # Root module (re-exports)
 ├─ LeanKohaku/
 │  ├─ Basic.lean
-│  ├─ Crypto/      Hex, Keccak, Sha256, Sha512, Secp256k1
-│  ├─ Encoding/    Rlp
+│  ├─ Crypto/      Hex, Secp256k1 scaffolding
 │  ├─ Ethereum/    Address, Chain, P256Precompile, Tx
 │  ├─ Privacy/     NetworkPolicy
 │  ├─ Network/     Endpoint, Provider
-│  ├─ LightClient/ Provider
 │  ├─ Keystore/    Enclave, Linux
 │  ├─ Contract/    R1Account
-│  ├─ Wallet/      Account, Mnemonic (BIP39), HDKey (BIP32)
+│  ├─ Wallet/      Account
 │  ├─ RPC/         JsonRpc
 │  ├─ Daemon/      Server
 │  ├─ Cli/         Commands
@@ -113,7 +110,8 @@ repository URL before publishing a package.
 ./.lake/build/bin/leankohaku wallet create sepolia
 ./.lake/build/bin/leankohaku wallet create sepolia work-key
 ./.lake/build/bin/leankohaku wallet list sepolia
-./.lake/build/bin/leankohaku wallet sign sepolia work-key 0x<32-byte-digest>
+./.lake/build/bin/leankohaku daemon help
+./.lake/build/bin/leankohaku daemon daily send sepolia 0x0000000000000000000000000000000000000000 0.001
 ./.lake/build/bin/leankohaku network
 ./.lake/build/bin/leankohaku security
 ./.lake/build/bin/leankohaku doctor
@@ -170,13 +168,13 @@ More detail:
 
 - [CLI](./docs/CLI.md)
 - [Privacy And Security](./docs/PRIVACY_SECURITY.md)
+- [Sepolia R1 Account Dev Flow](./docs/R1_SEPOLIA.md)
 
-## Light client
+## Provider Policy
 
-`LeanKohaku.LightClient.Provider` mirrors the shape of the upstream
-Kohaku provider package: a raw-provider operation surface plus a Helios
-light-client backend option. The current implementation is an abstract,
-policy-checked model rather than a transport implementation.
+`LeanKohaku.Network.Provider` models the small JSON-RPC surface the daemon
+may eventually need. It classifies methods by peer, purpose, and transport
+before any runtime networking is implemented.
 
 ## Keystore
 
@@ -195,7 +193,8 @@ keyring as a local handle store.
 It uses local `tpm2-tools` to create TPM-wrapped P-256 keys under
 `.leankohaku/keystore/tpm2/<name>/`, writes `public.pem` and `manifest.txt`,
 and refuses to overwrite an existing manifest. Key creation and signing are
-gated by local `fprintd-verify`.
+gated by local `fprintd-verify`, defaulting to `right-index-finger` with
+three verification attempts.
 
 Nix and Arch packaging list `tpm2-tools`, `libfido2`, and `fprintd` only as
 optional host-integration tools. The Lean wallet does not link to those
@@ -215,12 +214,26 @@ or `11155111` Sepolia), checks nonce equality, constructs the EIP-7951
 `h || r || s || qx || qy` precompile input, and increments nonce only after
 successful verification.
 
+`Contracts/R1Account/` contains the Verity-oriented Lean source for the
+deployable account. `script/r1_sepolia.sh` keeps the local digest/sign/execute
+workflow. For same-day Sepolia testing, `contracts/dev/R1AccountDev.sol`
+provides a temporary Solidity fallback; it is not the canonical source.
+
+Verity is pinned by `script/setup_verity.sh`. It is not imported into the
+default Lake graph yet because upstream Verity currently pins Lean 4.22.0
+while leanKohaku pins Lean 4.29.1.
+
 ## Invariants
 
 See [`INVARIANTS.md`](./INVARIANTS.md). The current proved inventory:
 
 | # | Invariant | Status |
 |---|-----------|--------|
+| 0.1 | Verified core cannot exfiltrate keys | ✅ |
+| 0.2 | Verified core is not a raw signing oracle | ✅ |
+| 0.3 | Verified intents cannot sign wrong-chain payloads | ✅ |
+| 0.4 | Approval and R1/EOA signer paths correspond to signatures | ✅ |
+| 0.5 | R1 TPM policy and EIP-7702 guardrails are enforced | ✅ |
 | 1.1 | Checked subtraction preserves totals | ✅ |
 | 1.2 | Multi-output send — refuse-insufficient + exact-debit + recipient crediting | ✅ |
 | 2.1 | EIP-1559 fee relation | ✅ (by definition) |

@@ -1,3 +1,7 @@
 /.lake
 /.leankohaku
 .env
+/out
+/cache
+/broadcast
+/artifacts
