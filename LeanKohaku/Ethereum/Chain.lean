@@ -11,6 +11,7 @@ structure Chain where
   deriving Repr
 
 def mainnet (rpc : String) : Chain := { id := 1,       name := "mainnet",  rpc }
+
 def sepolia (rpc : String) : Chain := { id := 11155111, name := "sepolia", rpc }
 
 end LeanKohaku.Ethereum.Chain

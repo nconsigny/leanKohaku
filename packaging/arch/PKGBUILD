@@ -1,0 +1,37 @@
+# Maintainer: leanKohaku maintainers
+pkgname=leankohaku-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Formally modeled Ethereum wallet daemon written in Lean 4"
+arch=('x86_64' 'aarch64')
+url="https://github.com/OWNER/leanKohaku"
+license=('custom:TBD')
+depends=('lean4')
+makedepends=('git')
+optdepends=(
+  'tpm2-tools: optional Linux TPM2 provisioning and inspection outside Lean'
+  'libfido2: optional FIDO2 security-key provisioning and inspection outside Lean'
+  'fprintd: optional Linux biometric enrollment outside Lean'
+)
+_repo_url="https://github.com/OWNER/leanKohaku.git"
+source=("${pkgname}::git+${_repo_url}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${srcdir}/${pkgname}"
+  printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "${srcdir}/${pkgname}"
+  export HOME="${srcdir}/home"
+  lake build
+}
+
+package() {
+  cd "${srcdir}/${pkgname}"
+  install -Dm755 ".lake/build/bin/leankohaku" "${pkgdir}/usr/bin/leankohaku"
+  install -Dm755 ".lake/build/bin/leankohaku-daemon" "${pkgdir}/usr/bin/leankohaku-daemon"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "INVARIANTS.md" "${pkgdir}/usr/share/doc/${pkgname}/INVARIANTS.md"
+}

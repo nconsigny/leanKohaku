@@ -1,0 +1,415 @@
+import LeanKohaku.Keystore.Enclave
+import LeanKohaku.Crypto.Hex
+import LeanKohaku.Wallet.Account
+
+/-!
+# Local TPM2 runtime backend
+
+This module is the narrow runtime boundary for Linux TPM2 key creation. It
+does not link TPM libraries or implement crypto outside Lean. Instead it
+executes local `tpm2-tools` commands, producing TPM-protected key blobs and
+public-key material in a local state directory.
+
+The private key is never exported as raw key material. The `*.priv` file
+created by `tpm2_create` is a TPM-wrapped private blob that must be loaded
+back into the same TPM hierarchy to sign.
+
+User verification is currently enforced as a local Linux gate through
+`fprintd-verify` before creating a new key. This is not yet a cryptographic
+TPM policy session, so signing must also require user verification when that
+runtime path is added.
+-/
+
+namespace LeanKohaku.Keystore.Tpm2Runtime
+
+open LeanKohaku.Ethereum.P256Precompile
+open LeanKohaku.Crypto.Hex
+open LeanKohaku.Keystore.Enclave
+open LeanKohaku.Wallet.Account
+
+structure Config where
+  stateDir : System.FilePath := ".leankohaku/keystore/tpm2"
+  keyName  : String := "sepolia-r1"
+  deriving Repr
+
+inductive CreateStatus where
+  | created
+  | alreadyExists
+  | invalidKeyName
+  | missingTpmDevice
+  | missingTool (tool : String)
+  | biometricVerificationFailed (stderr : String)
+  | policyRejected
+  | commandFailed (cmd : String) (stderr : String)
+  deriving Repr
+
+inductive SignStatus where
+  | signed
+  | invalidKeyName
+  | invalidDigest
+  | missingKey
+  | missingTpmDevice
+  | missingTool (tool : String)
+  | biometricVerificationFailed (stderr : String)
+  | commandFailed (cmd : String) (stderr : String)
+  deriving Repr
+
+structure SignReport where
+  status    : SignStatus
+  keyDir    : System.FilePath
+  digest    : System.FilePath
+  signature : System.FilePath
+  signatureHex : Option String
+  keyName   : String
+  chainId   : Nat
+  deriving Repr
+
+structure CreateReport where
+  status      : CreateStatus
+  keyDir      : System.FilePath
+  publicKey   : System.FilePath
+  manifest    : System.FilePath
+  chainId     : Nat
+  backend     : Backend
+  curve       : Curve
+  deriving Repr
+
+def Config.keyDir (cfg : Config) : System.FilePath :=
+  cfg.stateDir / cfg.keyName
+
+def Config.primaryCtx (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "primary.ctx"
+
+def Config.publicBlob (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "key.pub"
+
+def Config.privateBlob (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "key.priv"
+
+def Config.loadedCtx (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "key.ctx"
+
+def Config.publicPem (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "public.pem"
+
+def Config.manifest (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "manifest.txt"
+
+def Config.digestBin (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "digest.bin"
+
+def Config.signatureBin (cfg : Config) : System.FilePath :=
+  cfg.keyDir / "signature.bin"
+
+def requiredTools : List String :=
+  ["tpm2_createprimary", "tpm2_create", "tpm2_load", "tpm2_readpublic"]
+
+def signingTools : List String :=
+  ["tpm2_createprimary", "tpm2_load", "tpm2_sign"]
+
+def biometricTool : String :=
+  "fprintd-verify"
+
+def logStep (msg : String) : IO Unit :=
+  IO.println s!"[leankohaku:tpm2] {msg}"
+
+def deviceAvailable : BaseIO Bool := do
+  let tpm0 ← ("/dev/tpm0" : System.FilePath).pathExists
+  let tpmrm0 ← ("/dev/tpmrm0" : System.FilePath).pathExists
+  pure (tpm0 || tpmrm0)
+
+def keyNameCharAllowed (c : Char) : Bool :=
+  if ('a' ≤ c ∧ c ≤ 'z') then true
+  else if ('A' ≤ c ∧ c ≤ 'Z') then true
+  else if ('0' ≤ c ∧ c ≤ '9') then true
+  else decide (c = '-') || decide (c = '_')
+
+def validKeyName (name : String) : Bool :=
+  !name.isEmpty &&
+    decide (name.length ≤ 64) &&
+    name.toList.all keyNameCharAllowed
+
+def toolAvailable (tool : String) : IO Bool := do
+  try
+    let out ← IO.Process.output { cmd := tool, args := #["--version"] }
+    pure (out.exitCode == 0)
+  catch _ =>
+    pure false
+
+def fprintdAvailable : IO Bool := do
+  try
+    let out ← IO.Process.output { cmd := biometricTool, args := #["--help"] }
+    pure (out.exitCode == 0)
+  catch _ =>
+    pure false
+
+partial def firstMissingTool : List String → IO (Option String)
+  | [] => pure none
+  | tool :: rest => do
+      if ← toolAvailable tool then
+        firstMissingTool rest
+      else
+        pure (some tool)
+
+partial def firstMissingToolLogged : List String → IO (Option String)
+  | [] => pure none
+  | tool :: rest => do
+      logStep s!"checking tool: {tool}"
+      if ← toolAvailable tool then
+        logStep s!"tool available: {tool}"
+        firstMissingToolLogged rest
+      else
+        logStep s!"tool missing: {tool}"
+        pure (some tool)
+
+def runChecked (cmd : String) (args : Array String) : IO (Except String String) := do
+  try
+    let out ← IO.Process.output { cmd := cmd, args := args }
+    if out.exitCode == 0 then
+      pure (.ok out.stdout)
+    else
+      pure (.error out.stderr)
+  catch e =>
+    pure (.error e.toString)
+
+def verifyLocalUser : IO (Except String Unit) := do
+  logStep "starting biometric verification with fprintd"
+  IO.println "Biometric verification required. Touch your fingerprint sensor now."
+  let child ← IO.Process.spawn
+    { cmd := biometricTool,
+      args := #[],
+      stdin := .inherit,
+      stdout := .inherit,
+      stderr := .inherit }
+  let exitCode ← child.wait
+  if exitCode == 0 then
+    logStep "biometric verification succeeded"
+    pure (.ok ())
+  else
+    logStep s!"biometric verification failed with exit code {exitCode}"
+    pure (.error s!"{biometricTool} exited with code {exitCode}")
+
+def fileArg (path : System.FilePath) : String :=
+  path.toString
+
+def manifestContents (cfg : Config) : String :=
+  "leankohaku TPM2 key manifest\n" ++
+  "chain=sepolia\n" ++
+  s!"chain_id={sepoliaChainId}\n" ++
+  "account=r1-smart\n" ++
+  "backend=linuxTpm2\n" ++
+  "curve=p256\n" ++
+  "public_pem=public.pem\n" ++
+  "public_blob=key.pub\n" ++
+  "private_blob=key.priv\n" ++
+  "loaded_context=key.ctx\n" ++
+  "custody=local-tpm2\n" ++
+  "creation_user_verification=fprintd-verify\n" ++
+  "creation_user_verification_tpm_bound=false\n" ++
+  "raw_private_key_exported=false\n" ++
+  s!"key_name={cfg.keyName}\n"
+
+def mkReport (cfg : Config) (status : CreateStatus) : CreateReport :=
+  { status := status,
+    keyDir := cfg.keyDir,
+    publicKey := cfg.publicPem,
+    manifest := cfg.manifest,
+    chainId := sepoliaChainId,
+    backend := .linuxTpm2,
+    curve := .p256 }
+
+def mkSignReport
+    (cfg : Config)
+    (status : SignStatus)
+    (signatureHex : Option String := none) : SignReport :=
+  { status := status,
+    keyDir := cfg.keyDir,
+    digest := cfg.digestBin,
+    signature := cfg.signatureBin,
+    signatureHex := signatureHex,
+    keyName := cfg.keyName,
+    chainId := sepoliaChainId }
+
+def createPrimary (cfg : Config) : IO (Except String String) :=
+  runChecked "tpm2_createprimary"
+    #["-C", "o",
+      "-G", "ecc",
+      "-g", "sha256",
+      "-c", fileArg cfg.primaryCtx]
+
+def createSigningKeyWithAlg (cfg : Config) (alg : String) : IO (Except String String) :=
+  runChecked "tpm2_create"
+    #["-C", fileArg cfg.primaryCtx,
+      "-G", alg,
+      "-g", "sha256",
+      "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
+      "-u", fileArg cfg.publicBlob,
+      "-r", fileArg cfg.privateBlob]
+
+def createSigningKey (cfg : Config) : IO (Except String String) := do
+  match ← createSigningKeyWithAlg cfg "ecc_nist_p256" with
+  | .ok out => pure (.ok out)
+  | .error firstErr =>
+      match ← createSigningKeyWithAlg cfg "ecc256" with
+      | .ok out => pure (.ok out)
+      | .error secondErr =>
+          pure (.error (firstErr ++ "\nFallback ecc256 failed:\n" ++ secondErr))
+
+def loadSigningKey (cfg : Config) : IO (Except String String) :=
+  runChecked "tpm2_load"
+    #["-C", fileArg cfg.primaryCtx,
+      "-u", fileArg cfg.publicBlob,
+      "-r", fileArg cfg.privateBlob,
+      "-c", fileArg cfg.loadedCtx]
+
+def readPublicKey (cfg : Config) : IO (Except String String) :=
+  runChecked "tpm2_readpublic"
+    #["-c", fileArg cfg.loadedCtx,
+      "-o", fileArg cfg.publicPem,
+      "-f", "pem"]
+
+def signDigest (cfg : Config) : IO (Except String String) :=
+  runChecked "tpm2_sign"
+    #["-c", fileArg cfg.loadedCtx,
+      "-g", "sha256",
+      "-d",
+      "-f", "plain",
+      "-o", fileArg cfg.signatureBin,
+      fileArg cfg.digestBin]
+
+def createSepoliaR1Key (cfg : Config := {}) : IO CreateReport := do
+  logStep s!"create requested: chain=sepolia key={cfg.keyName}"
+  logStep s!"state directory: {cfg.stateDir}"
+  logStep s!"key directory: {cfg.keyDir}"
+  unless validKeyName cfg.keyName do
+    logStep "rejected invalid key name"
+    return mkReport cfg .invalidKeyName
+  unless accepted sepoliaR1Smart do
+    logStep "rejected by Sepolia R1 account policy"
+    return mkReport cfg .policyRejected
+  unless (← deviceAvailable) do
+    logStep "no TPM device found at /dev/tpm0 or /dev/tpmrm0"
+    return mkReport cfg .missingTpmDevice
+  logStep "TPM device visible"
+  match ← firstMissingToolLogged requiredTools with
+  | some tool => return mkReport cfg (.missingTool tool)
+  | none => pure ()
+
+  if ← cfg.manifest.pathExists then
+    logStep s!"existing manifest found, refusing overwrite: {cfg.manifest}"
+    return mkReport cfg .alreadyExists
+
+  unless (← fprintdAvailable) do
+    logStep "biometric tool missing: fprintd-verify"
+    return mkReport cfg (.missingTool biometricTool)
+
+  match ← verifyLocalUser with
+  | .error err => return mkReport cfg (.biometricVerificationFailed err)
+  | .ok _ => pure ()
+
+  logStep s!"creating key directory: {cfg.keyDir}"
+  IO.FS.createDirAll cfg.keyDir
+
+  logStep "running tpm2_createprimary"
+  match ← createPrimary cfg with
+  | .error err => return mkReport cfg (.commandFailed "tpm2_createprimary" err)
+  | .ok _ => pure ()
+
+  logStep "running tpm2_create for P-256 signing key"
+  match ← createSigningKey cfg with
+  | .error err => return mkReport cfg (.commandFailed "tpm2_create" err)
+  | .ok _ => pure ()
+
+  logStep "running tpm2_load"
+  match ← loadSigningKey cfg with
+  | .error err => return mkReport cfg (.commandFailed "tpm2_load" err)
+  | .ok _ => pure ()
+
+  logStep "running tpm2_readpublic"
+  match ← readPublicKey cfg with
+  | .error err => return mkReport cfg (.commandFailed "tpm2_readpublic" err)
+  | .ok _ => pure ()
+
+  logStep s!"writing manifest: {cfg.manifest}"
+  IO.FS.writeFile cfg.manifest (manifestContents cfg)
+  logStep "TPM2 key creation complete"
+  return mkReport cfg .created
+
+def listSepoliaKeys (stateDir : System.FilePath := ".leankohaku/keystore/tpm2") :
+    IO (List String) := do
+  unless (← stateDir.pathExists) do
+    return []
+  let entries ← stateDir.readDir
+  let mut names : List String := []
+  for entry in entries do
+    if (← entry.path.isDir) && (← (entry.path / "manifest.txt").pathExists) then
+      names := names ++ [entry.fileName]
+  return names
+
+def signSepoliaDigest
+    (digestHex : String)
+    (cfg : Config := {}) : IO SignReport := do
+  logStep s!"sign requested: chain=sepolia key={cfg.keyName}"
+  logStep s!"key directory: {cfg.keyDir}"
+  unless validKeyName cfg.keyName do
+    logStep "rejected invalid key name"
+    return mkSignReport cfg .invalidKeyName
+  unless (← deviceAvailable) do
+    logStep "no TPM device found at /dev/tpm0 or /dev/tpmrm0"
+    return mkSignReport cfg .missingTpmDevice
+  logStep "TPM device visible"
+  unless (← cfg.manifest.pathExists) do
+    logStep s!"missing manifest: {cfg.manifest}"
+    return mkSignReport cfg .missingKey
+  match decode digestHex with
+  | none =>
+      logStep "digest hex decode failed"
+      return mkSignReport cfg .invalidDigest
+  | some digest =>
+      unless digest.size == 32 do
+        logStep s!"invalid digest byte length: {digest.size}"
+        return mkSignReport cfg .invalidDigest
+      logStep "digest accepted: 32 bytes"
+      match ← firstMissingToolLogged signingTools with
+      | some tool => return mkSignReport cfg (.missingTool tool)
+      | none => pure ()
+
+      unless (← fprintdAvailable) do
+        logStep "biometric tool missing: fprintd-verify"
+        return mkSignReport cfg (.missingTool biometricTool)
+
+      match ← verifyLocalUser with
+      | .error err => return mkSignReport cfg (.biometricVerificationFailed err)
+      | .ok _ => pure ()
+
+      logStep s!"writing digest file: {cfg.digestBin}"
+      IO.FS.writeBinFile cfg.digestBin digest
+
+      logStep "running tpm2_createprimary"
+      match ← createPrimary cfg with
+      | .error err => return mkSignReport cfg (.commandFailed "tpm2_createprimary" err)
+      | .ok _ => pure ()
+
+      logStep "running tpm2_load"
+      match ← loadSigningKey cfg with
+      | .error err => return mkSignReport cfg (.commandFailed "tpm2_load" err)
+      | .ok _ => pure ()
+
+      logStep "running tpm2_sign"
+      match ← signDigest cfg with
+      | .error err => return mkSignReport cfg (.commandFailed "tpm2_sign" err)
+      | .ok _ =>
+          let sig ← IO.FS.readBinFile cfg.signatureBin
+          logStep s!"signature written: {cfg.signatureBin}"
+          return mkSignReport cfg .signed (some (encode sig))
+
+def CreateStatus.exitCode : CreateStatus → UInt32
+  | .created => 0
+  | .alreadyExists => 0
+  | _ => 1
+
+def SignStatus.exitCode : SignStatus → UInt32
+  | .signed => 0
+  | _ => 1
+
+end LeanKohaku.Keystore.Tpm2Runtime

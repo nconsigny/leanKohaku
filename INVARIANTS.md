@@ -80,11 +80,12 @@ another tx with nonce `≤ k` for `a`.
 **Prop:** `∀ l a n, validNext l a n → n > (l a).getD 0`
 **Status:** 📝 stated — `LeanKohaku/Invariants/Nonce.lean`
 
-### 3.3 Signature recoverability
-For every signed tx produced by the wallet, `ecrecover(hash, sig) = pubkey`
-of the signing account. (Requires secp256k1 spec first.)
+### 3.3 R1 signature verifiability
+For every operation signed by the local keystore, the account logic can
+verify the P-256/R1 signature against the stored public key through the
+Ethereum P256VERIFY precompile model.
 
-**Prop:** TBD (depends on `Crypto.Secp256k1` implementation)
+**Prop:** TBD (depends on account validation model + P256 precompile call encoding)
 **Status:** 📝 stated
 
 ---
@@ -103,6 +104,21 @@ Every RLP item decodes back to itself after encoding.
 **Prop:** `∀ b : ByteArray, Hex.decode (Hex.encode b) = some b`
 **Status:** 📝 stated — `LeanKohaku/Crypto/Hex.lean`
 
+### 4.3 Account policies are supported-chain/local-only
+The CLI supports regular BIP-39 k1 EOAs and local R1 smart accounts. Both
+accepted policies are local custody only and limited to explicitly supported
+Ethereum chains: mainnet for production and Sepolia for development.
+
+**Props:**
+- `accepted p = true → supportedChainId p.chainId = true`
+- `accepted p = true → p.localOnly = true`
+- `accepted defaultEoaK1 = true`
+- `accepted defaultR1Smart = true`
+- `accepted sepoliaEoaK1 = true`
+- `accepted sepoliaR1Smart = true`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Account.lean`
+
 ---
 
 ## Category 5 — Railgun / privacy notes (later)
@@ -119,6 +135,151 @@ Sum of values shielded in = sum of notes created + fee.
 
 **Prop:** TBD
 **Status:** 📝 stated (future)
+
+---
+
+## Category 6 — Network privacy
+
+### 6.1 CLI only talks to the local daemon
+The CLI must not contact Ethereum nodes, third-party APIs, analytics,
+price feeds, metadata services, or discovery services. It may only use
+the local daemon control channel.
+
+**Prop:** `strictCliPolicy req = true → req.peer = localDaemon ∧ req.purpose = daemonControl ∧ req.transport = loopback`
+**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictCli_onlyLocalDaemon`
+
+### 6.2 Daemon never talks to third-party APIs
+The daemon is the only component allowed to perform node I/O, but strict
+daemon policy rejects all third-party API peers.
+
+**Prop:** `strictDaemonPolicy req = true → req.peer ≠ thirdPartyApi`
+**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictDaemon_neverThirdParty`
+
+### 6.3 Configured-node access is broadcast-only
+Read queries should stay local/light-client oriented. If the strict policy
+allows a configured remote node, it must be for transaction broadcast only.
+
+**Prop:** `strictDaemonPolicy req = true → req.peer = configuredNode → req.purpose = broadcastTx`
+**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::strictDaemon_configuredNodeOnlyBroadcast`
+
+### 6.4 Tor configured-node access must use Tor transport
+Cake Wallet's Tor/proxy model is useful, but leanKohaku keeps it explicit:
+Tor mode may use a configured node for reads or broadcasts only when the
+transport is Tor. Third-party APIs remain denied.
+
+**Prop:** `torDaemonPolicy req = true → req.peer = configuredNode → req.transport = tor`
+**Status:** ✅ proved — `LeanKohaku/Invariants/NetworkPrivacy.lean::torDaemon_configuredNodeOnlyTor`
+
+---
+
+## Category 7 — Light-client provider
+
+### 7.1 Provider non-broadcast methods are reads
+The Kohaku-style provider surface classifies read-only methods separately
+from `eth_sendRawTransaction`, so future transport code can deny broad
+remote querying and permit only strictly necessary broadcasts.
+
+**Prop:** `m ≠ sendRawTransaction → m.purpose = nodeRead`
+**Status:** ✅ proved — `LeanKohaku/Invariants/LightClient.lean::nonBroadcastMethodsAreReads`
+
+### 7.2 Default mainnet Helios log bypass disabled
+Upstream Kohaku's Helios wrapper has an optional `eth_getLogs` execution-RPC
+bypass. leanKohaku models this explicitly and disables it by default.
+
+**Prop:** `permittedLogBypass strictDaemonPolicy Config.defaultMainnet = false`
+**Status:** ✅ proved — `LeanKohaku/Invariants/LightClient.lean::defaultMainnetLogBypassDisabled`
+
+### 7.3 Tor provider access is transport-scoped
+When the provider model is evaluated under Tor daemon policy, any allowed
+configured-node access must be classified as Tor transport.
+
+**Prop:** `permitted torDaemonPolicy cfg op = true → (requestFor cfg op).peer = configuredNode → (requestFor cfg op).transport = tor`
+**Status:** ✅ proved — `LeanKohaku/Invariants/LightClient.lean::torPolicyConfiguredPeerOnlyTor`
+
+---
+
+## Category 8 — Local keystore
+
+### 8.1 Accepted keystore requests never export secrets
+The wallet-facing keystore API is local-only and does not expose raw
+private keys, seed material, or import/export flows in accepted operation.
+
+**Prop:** `policyAccepts req = true → req.op ≠ exportSecret ∧ req.op ≠ importSecret`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Keystore.lean::acceptedNeverExportsSecrets`
+
+### 8.2 Accepted keystore requests are local-only
+The keystore model is not an online service. Accepted requests must use
+local-only platform or local hardware custody.
+
+**Prop:** `policyAccepts req = true → req.policy.locality = localOnly ∧ req.policy.backend.localOnly = true`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Keystore.lean::acceptedRequiresLocalOnly`
+
+### 8.3 Accepted signing requires user authorization
+Signing requires a hardware-backed backend and user authorization, modeled
+as biometrics or explicit user presence.
+
+**Prop:** `policyAccepts { op := signDigest, policy := policy } = true → policy.requiredAuth = biometric ∨ policy.requiredAuth = userPresence`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Keystore.lean::acceptedSigningRequiresUserAuth`
+
+### 8.4 Apple Secure Enclave accepts local Ethereum R1 signing policy
+Native Apple Secure Enclave is modeled for P-256/R1. Ethereum mainnet
+support uses account logic plus P256VERIFY rather than an EOA secp256k1
+key.
+
+**Prop:** `policyAccepts { op := signDigest, policy := appleEthereumR1Policy } = true`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Keystore.lean::appleSecureEnclaveAcceptsEthereumR1Signing`
+
+### 8.5 Linux HP/Lenovo profiles prefer TPM2 signing
+Common HP business notebook/workstation and Lenovo ThinkPad/ThinkCentre
+profiles select TPM2 as the first hardware-backed local P-256/R1 signing
+backend. FIDO2 is modeled as the fallback for systems without TPM2, while
+the Linux kernel keyring is handle storage only.
+
+**Props:**
+- `selectSigningPolicy hpBusinessNotebook = some linuxTpm2Policy`
+- `selectSigningPolicy hpMobileWorkstation = some linuxTpm2Policy`
+- `selectSigningPolicy lenovoThinkPad = some linuxTpm2Policy`
+- `selectSigningPolicy lenovoThinkCentre = some linuxTpm2Policy`
+- `selectSigningPolicy genericFido2Only = some linuxFido2Policy`
+- `selectHandleStore hpBusinessNotebook = some linuxKernelKeyring`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Keystore.lean`
+
+---
+
+## Category 9 — Ethereum EIP-7951 P256VERIFY
+
+### 9.1 EIP-7951 P256VERIFY constants and chain ids
+The wallet targets Ethereum L1 mainnet for production and Sepolia for
+development. It models the EIP-7951 R1 verification precompile at address
+`0x100`, input length `160`, success output length `32`, failure output
+length `0`, and gas cost `6900`.
+
+**Prop:** `mainnetChainId = 1 ∧ sepoliaChainId = 11155111 ∧ address = 0x100 ∧ inputLength = 160 ∧ gasCost = 6900`
+**Status:** ✅ proved — `LeanKohaku/Invariants/Mainnet.lean`
+
+---
+
+## Category 10 — R1 account contract
+
+### 10.1 R1 account accepts only supported-chain operations
+The account model rejects any operation whose chain id is not explicitly
+supported by the wallet policy.
+
+**Prop:** `apply st op verify = some st' → supportedChainId op.chainId = true`
+**Status:** ✅ proved — `LeanKohaku/Invariants/R1Account.lean::applySomeSupportedChainOnly`
+
+### 10.2 R1 account nonce advances only after EIP-7951 verification
+Accepted operations must consume the current nonce, use valid EIP-7951
+precompile input, and pass the verifier hook before nonce advances.
+
+**Props:**
+- `apply st op verify = some st' → op.nonce = st.nonce`
+- `apply st op verify = some st' → validInput (toPrecompileInput st.key op)`
+- `apply st op verify = some st' → verify (toPrecompileInput st.key op) = true`
+- `apply st op verify = some st' → st'.nonce = st.nonce + 1`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/R1Account.lean`
 
 ---
 
