@@ -1,0 +1,95 @@
+import LeanKohaku.Crypto.Hex
+
+/-!
+# Native cryptographic boundary
+
+Hash/KDF/AEAD operations are intentionally modeled as a narrow external
+boundary. The primary implementation is HACL*/hacl-packages from Project
+Everest. HACL exposes raw Keccak with arbitrary delimiter; Ethereum uses
+delimiter `0x01`, not FIPS-202 SHA3's `0x06`.
+
+RIPEMD-160 is provided by a separate RustCrypto `ripemd` helper because the
+pinned HACL package does not expose RIPEMD-160. It is used for BIP-32 HASH160
+fingerprints, not Ethereum address derivation.
+
+The wallet core proves it only asks for typed hashes/signatures. Functional
+correctness of these primitives is delegated to the native helper boundary and
+standard cryptographic assumptions.
+-/
+
+namespace LeanKohaku.Crypto.Hacl
+
+opaque keccak256Ethereum : ByteArray → ByteArray
+
+opaque sha256 : ByteArray → ByteArray
+
+opaque hmacSha256 : ByteArray → ByteArray → ByteArray
+
+opaque hmacSha512 : ByteArray → ByteArray → ByteArray
+
+opaque ripemd160 : ByteArray → ByteArray
+
+opaque pbkdf2HmacSha512 : ByteArray → ByteArray → Nat → Nat → ByteArray
+
+opaque hmacDrbgSha256 : ByteArray → ByteArray → ByteArray → ByteArray → Nat → ByteArray
+
+opaque chacha20Poly1305Seal : ByteArray → ByteArray → ByteArray → ByteArray → ByteArray
+
+opaque chacha20Poly1305Open : ByteArray → ByteArray → ByteArray → ByteArray → Option ByteArray
+
+def ethereumKeccakDelimiter : UInt8 := 0x01
+
+def helperKeccak : String := "leankohaku-hacl-keccak256"
+def helperSha256 : String := "leankohaku-hacl-sha256"
+def helperHmacSha256 : String := "leankohaku-hacl-hmac-sha256"
+def helperHmacSha512 : String := "leankohaku-hacl-hmac-sha512"
+def helperRipemd160 : String := "leankohaku-hacl-ripemd160"
+def helperPbkdf2 : String := "leankohaku-hacl-pbkdf2"
+def helperHmacDrbg : String := "leankohaku-hacl-hmac-drbg"
+def helperChacha20Poly1305 : String := "leankohaku-hacl-chacha20poly1305"
+
+def runHexHelper (cmd : String) (args : Array String) : IO (Except String ByteArray) := do
+  try
+    let out ← IO.Process.output { cmd := cmd, args := args }
+    if out.exitCode == 0 then
+      match LeanKohaku.Crypto.Hex.decode out.stdout.trimAscii.toString with
+      | some bytes => pure (.ok bytes)
+      | none => pure (.error s!"{cmd} returned non-hex output")
+    else
+      pure (.error out.stderr)
+  catch e =>
+    pure (.error e.toString)
+
+def keccak256EthereumIO (inputHex : String) : IO (Except String ByteArray) :=
+  runHexHelper helperKeccak #[inputHex]
+
+def sha256IO (inputHex : String) : IO (Except String ByteArray) :=
+  runHexHelper helperSha256 #[inputHex]
+
+def hmacSha256IO (keyHex msgHex : String) : IO (Except String ByteArray) :=
+  runHexHelper helperHmacSha256 #[keyHex, msgHex]
+
+def hmacSha512IO (keyHex msgHex : String) : IO (Except String ByteArray) :=
+  runHexHelper helperHmacSha512 #[keyHex, msgHex]
+
+def ripemd160IO (inputHex : String) : IO (Except String ByteArray) :=
+  runHexHelper helperRipemd160 #[inputHex]
+
+def pbkdf2HmacSha512IO (passwordHex saltHex : String) (iters dkLen : Nat) :
+    IO (Except String ByteArray) :=
+  runHexHelper helperPbkdf2 #[passwordHex, saltHex, toString iters, toString dkLen]
+
+def hmacDrbgSha256IO (entropyHex nonceHex personalizationHex additionalHex : String)
+    (outLen : Nat) : IO (Except String ByteArray) :=
+  runHexHelper helperHmacDrbg
+    #[entropyHex, nonceHex, personalizationHex, additionalHex, toString outLen]
+
+def chacha20Poly1305SealIO (keyHex nonceHex aadHex payloadHex : String) :
+    IO (Except String ByteArray) :=
+  runHexHelper helperChacha20Poly1305 #["seal", keyHex, nonceHex, aadHex, payloadHex]
+
+def chacha20Poly1305OpenIO (keyHex nonceHex aadHex payloadHex : String) :
+    IO (Except String ByteArray) :=
+  runHexHelper helperChacha20Poly1305 #["open", keyHex, nonceHex, aadHex, payloadHex]
+
+end LeanKohaku.Crypto.Hacl

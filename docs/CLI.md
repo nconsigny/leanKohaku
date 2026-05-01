@@ -25,6 +25,7 @@ leankohaku rpc-check strict configured direct eth_getBalance
 leankohaku rpc-check tor configured tor eth_sendRawTransaction
 leankohaku endpoint-check strict local http loopback false
 leankohaku endpoint-check tor configured onion tor false
+leankohaku decode erc20 0xa9059cbb...
 ```
 
 Wallet-action preflight:
@@ -49,6 +50,13 @@ leankohaku daemon daily send sepolia 0xAa651C04bfE4F302eE243D6638d3B91389C4C02C 
 This is the preferred user-facing send path. It takes ETH units, computes
 the R1 account digest, requires local TPM/fingerprint signing, and then
 broadcasts the R1 account `execute` transaction on Sepolia.
+
+EOA runtime signing requires HACL Packages helpers:
+
+```bash
+sudo apt install git cmake ninja-build gcc
+./script/setup_hacl.sh
+```
 
 ## Regression Check
 

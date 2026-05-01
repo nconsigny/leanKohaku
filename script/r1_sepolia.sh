@@ -166,7 +166,7 @@ case "$cmd" in
     pk="$(deployer_private_key)"
     read -r qx qy < <(load_pubkey_xy)
     cat >&2 <<'EOF'
-WARNING: deploying contracts/dev/R1AccountDev.sol.
+WARNING: deploying solidity/dev/R1AccountDev.sol.
 This is a temporary Solidity fallback for Sepolia testing only.
 Canonical source remains Contracts/R1Account/R1Account.lean.
 EOF
@@ -174,7 +174,7 @@ EOF
       --rpc-url "$SEPOLIA_RPC_URL" \
       --private-key "$pk" \
       --broadcast \
-      contracts/dev/R1AccountDev.sol:R1AccountDev \
+      solidity/dev/R1AccountDev.sol:R1AccountDev \
       --constructor-args "$qx" "$qy")"
     echo "$out"
     addr="$(printf '%s\n' "$out" | awk '/Deployed to:/ {print $3}')"

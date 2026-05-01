@@ -1,3 +1,4 @@
+import LeanKohaku.Encoding.Json
 import LeanKohaku.Privacy.NetworkPolicy
 
 /-!
@@ -14,17 +15,18 @@ for local/light-client reads and strictly necessary transaction broadcast.
 namespace LeanKohaku.RPC.JsonRpc
 
 open LeanKohaku.Privacy.NetworkPolicy
+open LeanKohaku.Encoding.Json
 
 structure Request where
   method : String
-  params : List String  -- placeholder; will become a proper Json value
+  params : Json
   id     : Nat
   deriving Repr
 
 structure Response where
   id     : Nat
-  result : Option String
-  error  : Option String
+  result : Option Json
+  error  : Option Json
   deriving Repr
 
 /-- Classify an Ethereum JSON-RPC method before transport code can send it. -/
@@ -37,6 +39,38 @@ def purposeForMethod (method : String) : Purpose :=
 def requestPolicyCheck (policy : Policy) (peer : Peer) (transport : Transport) (req : Request) : Bool :=
   policy { peer := peer, purpose := purposeForMethod req.method, transport := transport }
 
--- TODO: encodeRequest / decodeResponse, `call : Chain → Request → IO Response`.
+def encodeRequest (req : Request) : String :=
+  compact <| .obj #[
+    ("jsonrpc", .str "2.0"),
+    ("method", .str req.method),
+    ("params", req.params),
+    ("id", .num (Int.ofNat req.id))
+  ]
+
+def callRaw (rpcUrl : String) (req : Request) : IO String := do
+  let out ← IO.Process.output
+    { cmd := "curl",
+      args := #[
+        "-sS",
+        "-H", "content-type: application/json",
+        "--data", encodeRequest req,
+        rpcUrl
+      ] }
+  if out.exitCode == 0 then
+    pure out.stdout
+  else
+    throw <| IO.userError out.stderr
+
+def ethSendRawTransaction (rpcUrl rawTxHex : String) : IO String :=
+  callRaw rpcUrl { method := "eth_sendRawTransaction", params := .arr #[.str rawTxHex], id := 1 }
+
+def ethCall (rpcUrl to data : String) : IO String :=
+  callRaw rpcUrl
+    { method := "eth_call",
+      params := .arr #[
+        .obj #[("to", .str to), ("data", .str data)],
+        .str "latest"
+      ],
+      id := 1 }
 
 end LeanKohaku.RPC.JsonRpc

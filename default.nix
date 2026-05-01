@@ -9,6 +9,9 @@ pkgs.stdenv.mkDerivation rec {
   nativeBuildInputs = [
     pkgs.git
     pkgs.lean4
+    pkgs.cmake
+    pkgs.ninja
+    pkgs.clang
   ];
 
   buildPhase = ''
@@ -42,6 +45,9 @@ pkgs.stdenv.mkDerivation rec {
       wallet. Linux TPM2, FIDO2, and keyring support is currently modeled as a
       local policy boundary; system packages such as tpm2-tools, libfido2, and
       fprintd are optional operator tooling for host provisioning and testing.
+      HACL Packages is the only accepted external crypto dependency and is
+      wired through script/setup_hacl.sh rather than linked into the default
+      Lean build.
     '';
     mainProgram = "leankohaku";
     platforms = platforms.linux;

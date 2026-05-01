@@ -39,6 +39,9 @@
             packages = [
               pkgs.git
               pkgs.lean4
+              pkgs.cmake
+              pkgs.ninja
+              pkgs.clang
 
               # Optional host-integration tools. The Lean code does not link
               # to these packages; they are for provisioning and inspection.

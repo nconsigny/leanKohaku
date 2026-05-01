@@ -1,0 +1,12 @@
+[package]
+name = "leankohaku-rustcrypto-helpers"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "leankohaku-hacl-ripemd160"
+path = "src/bin/ripemd160.rs"
+
+[dependencies]
+ripemd = "0.1.3"

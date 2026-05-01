@@ -25,7 +25,7 @@ At the moment upstream Verity pins Lean 4.22.0 while leanKohaku pins Lean
 ```
 
 Until the Verity compile bridge is complete, `deploy` uses the temporary
-Solidity fallback in `contracts/dev/R1AccountDev.sol`. This is for Sepolia
+Solidity fallback in `solidity/dev/R1AccountDev.sol`. This is for Sepolia
 testing only; `Contracts/R1Account/R1Account.lean` remains canonical.
 The helper passes `--broadcast` to Foundry so the deployment is actually
 sent to Sepolia.

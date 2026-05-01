@@ -178,6 +178,28 @@ def runChecked (cmd : String) (args : Array String) : IO (Except String String) 
   catch e =>
     pure (.error e.toString)
 
+def chmodPath (mode : String) (path : System.FilePath) : IO Unit := do
+  let _ ← IO.Process.output { cmd := "chmod", args := #[mode, path.toString] }
+  pure ()
+
+def hardenDir (path : System.FilePath) : IO Unit :=
+  chmodPath "700" path
+
+def hardenFile (path : System.FilePath) : IO Unit :=
+  chmodPath "600" path
+
+def hardenKeyDir (cfg : Config) : IO Unit := do
+  hardenDir ".leankohaku"
+  hardenDir ".leankohaku/keystore"
+  hardenDir cfg.stateDir
+  hardenDir cfg.keyDir
+
+def hardenKeyFiles (cfg : Config) : IO Unit := do
+  for path in [cfg.primaryCtx, cfg.publicBlob, cfg.privateBlob, cfg.loadedCtx,
+      cfg.publicPem, cfg.manifest, cfg.digestBin, cfg.signatureBin] do
+    if ← path.pathExists then
+      hardenFile path
+
 def biometricFinger : IO String := do
   match ← IO.getEnv "LEAN_KOHAKU_BIOMETRIC_FINGER" with
   | some finger =>
@@ -333,6 +355,7 @@ def createSepoliaR1Key (cfg : Config := {}) : IO CreateReport := do
 
   logStep s!"creating key directory: {cfg.keyDir}"
   IO.FS.createDirAll cfg.keyDir
+  hardenKeyDir cfg
 
   logStep "running tpm2_createprimary"
   match ← createPrimary cfg with
@@ -356,6 +379,7 @@ def createSepoliaR1Key (cfg : Config := {}) : IO CreateReport := do
 
   logStep s!"writing manifest: {cfg.manifest}"
   IO.FS.writeFile cfg.manifest (manifestContents cfg)
+  hardenKeyFiles cfg
   logStep "TPM2 key creation complete"
   return mkReport cfg .created
 
@@ -408,6 +432,8 @@ def signSepoliaDigest
 
       logStep s!"writing digest file: {cfg.digestBin}"
       IO.FS.writeBinFile cfg.digestBin digest
+      hardenKeyDir cfg
+      hardenFile cfg.digestBin
 
       logStep "running tpm2_createprimary"
       match ← createPrimary cfg with
@@ -424,6 +450,7 @@ def signSepoliaDigest
       | .error err => return mkSignReport cfg (.commandFailed "tpm2_sign" err)
       | .ok _ =>
           let sig ← IO.FS.readBinFile cfg.signatureBin
+          hardenKeyFiles cfg
           logStep s!"signature written: {cfg.signatureBin}"
           return mkSignReport cfg .signed (some (encode sig))
 

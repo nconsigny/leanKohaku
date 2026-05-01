@@ -7,7 +7,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/OWNER/leanKohaku"
 license=('custom:TBD')
 depends=('lean4')
-makedepends=('git')
+makedepends=('git' 'cmake' 'ninja' 'clang')
 optdepends=(
   'tpm2-tools: optional Linux TPM2 provisioning and inspection outside Lean'
   'libfido2: optional FIDO2 security-key provisioning and inspection outside Lean'

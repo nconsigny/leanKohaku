@@ -74,19 +74,13 @@ check "DENY mode=tor endpoint-kind=configured scheme=onion transport=tor credent
 check "DENY mode=tor endpoint-kind=third-party scheme=http transport=tor credentialed=false" \
   endpoint-check tor third-party http tor false
 
-check_exit 1 "preflight OK: balance address=0x0000000000000000000000000000000000000000" \
-  balance 0x0000000000000000000000000000000000000000
-
-check_exit 1 $'preflight OK: balance address=0x0000000000000000000000000000000000000000\nnetwork: local-daemon daemon-control loopback\ndaemon-plan: backend=local method=eth_getBalance' \
+check_exit 2 "daemon error -32000:" \
   balance 0x0000000000000000000000000000000000000000
 
 check_exit 2 "invalid balance address: bad" \
   balance bad
 
-check_exit 1 "preflight OK: send to=0x0000000000000000000000000000000000000000 amountWei=1" \
-  send 0x0000000000000000000000000000000000000000 1
-
-check_exit 1 $'preflight OK: send to=0x0000000000000000000000000000000000000000 amountWei=1\nnetwork: local-daemon daemon-control loopback\ndaemon-plan: backend=local method=eth_sendRawTransaction' \
+check_exit 2 "send requires a named unlocked wallet" \
   send 0x0000000000000000000000000000000000000000 1
 
 check_exit 2 "invalid send arguments: to=0x0000000000000000000000000000000000000000 amountWei=0" \

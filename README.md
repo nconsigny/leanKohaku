@@ -56,10 +56,10 @@ leanKohaku/
 ├─ lakefile.lean                  # Lake build config
 ├─ lean-toolchain                 # pinned Lean version
 ├─ flake.nix / default.nix        # Nix package scaffold
-├─ Main.lean                      # CLI entrypoint
-├─ DaemonMain.lean                # Daemon entrypoint
 ├─ LeanKohaku.lean                # Root module (re-exports)
 ├─ LeanKohaku/
+│  ├─ App/        CLI and daemon executable roots
+│  ├─ Lib/        Client/Core/Spec aggregate roots
 │  ├─ Basic.lean
 │  ├─ Crypto/      Hex, Secp256k1 scaffolding
 │  ├─ Ethereum/    Address, Chain, P256Precompile, Tx
@@ -119,6 +119,7 @@ repository URL before publishing a package.
 ./.lake/build/bin/leankohaku rpc-check tor configured tor eth_sendRawTransaction
 ./.lake/build/bin/leankohaku endpoint-check strict local http loopback false
 ./.lake/build/bin/leankohaku endpoint-check tor configured onion tor false
+./.lake/build/bin/leankohaku decode erc20 0xa9059cbb...
 ./.lake/build/bin/leankohaku balance 0x0000000000000000000000000000000000000000
 ./.lake/build/bin/leankohaku send 0x0000000000000000000000000000000000000000 1
 ./.lake/build/bin/leankohaku daemon    # starts the daemon (stub for now)
@@ -216,12 +217,32 @@ successful verification.
 
 `Contracts/R1Account/` contains the Verity-oriented Lean source for the
 deployable account. `script/r1_sepolia.sh` keeps the local digest/sign/execute
-workflow. For same-day Sepolia testing, `contracts/dev/R1AccountDev.sol`
+workflow. For same-day Sepolia testing, `solidity/dev/R1AccountDev.sol`
 provides a temporary Solidity fallback; it is not the canonical source.
 
 Verity is pinned by `script/setup_verity.sh`. It is not imported into the
 default Lake graph yet because upstream Verity currently pins Lean 4.22.0
 while leanKohaku pins Lean 4.29.1.
+
+## EOA And Encoding Status
+
+The repo includes pure Lean RLP encoding, EIP-1559 typed transaction
+payload/transaction encoding, ERC-20 transfer/approval decoding, and native
+secp256k1 field/point arithmetic with ECDSA signing over an already-hashed
+digest plus explicit nonce.
+
+Keccak-256 and HMAC-SHA512 are modeled as a narrow HACL* boundary in
+`LeanKohaku.Crypto.Hacl`. The intended implementation is HACL's raw
+Keccak-with-delimiter API using Ethereum delimiter `0x01`, plus HMAC-SHA512
+for BIP32. Runtime EOA signing is not complete until that HACL binding is
+wired.
+
+HACL Packages is the only accepted external crypto dependency. Set it up with:
+
+```bash
+./script/setup_hacl.sh
+export PATH="$PWD/.lake/build/bin:$PATH"
+```
 
 ## Invariants
 

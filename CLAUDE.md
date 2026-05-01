@@ -14,8 +14,8 @@ lake build                                      # builds lib + both executables
 ```
 
 Artifacts land in `.lake/build/bin/`:
-- `leankohaku`         — CLI (root: `Main.lean`)
-- `leankohaku-daemon`  — daemon (root: `DaemonMain.lean`)
+- `leankohaku`         — CLI (root: `LeanKohaku/App/Main.lean`)
+- `leankohaku-daemon`  — daemon (root: `LeanKohaku/App/DaemonMain.lean`)
 
 Build a single module while iterating on proofs: `lake build LeanKohaku.Invariants.Wallet`.
 
@@ -31,7 +31,7 @@ Three-layer structure; dependency flows downward and the `Invariants` tree is wh
 
 1. **Primitives** — `LeanKohaku/Crypto/` (Hex, Secp256k1 scaffolding). Pure, no IO.
 2. **Domain** — `LeanKohaku/Ethereum/`, `LeanKohaku/Wallet/`, `LeanKohaku/Keystore/`, `LeanKohaku/Contract/`. Runtime TPM2 integration is isolated in `Keystore/Tpm2Runtime.lean`.
-3. **Surfaces** — `LeanKohaku/RPC/JsonRpc.lean`, `LeanKohaku/Daemon/Server.lean`, `LeanKohaku/Cli/Commands.lean`. The CLI parses argv to a `Command` ADT; `daemon` delegates to `Daemon.Server.run` or local wallet helpers. The daemon server is still a stub.
+3. **Surfaces** — `LeanKohaku/RPC/`, `LeanKohaku/Daemon/`, `LeanKohaku/Cli/`, and executable roots under `LeanKohaku/App/`. The CLI parses argv to a `Command` ADT and forwards wallet/chain work to the daemon.
 
 `LeanKohaku.lean` is import-only and re-exports every module, so downstream code writes `import LeanKohaku`.
 

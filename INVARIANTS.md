@@ -149,13 +149,32 @@ Ethereum P256VERIFY precompile model.
 Every RLP item decodes back to itself after encoding.
 
 **Prop:** TBD once the RLP module is reintroduced
-**Status:** 📝 stated — future encoding module
+**Status:** 🚧 in-progress — structural lemmas (`natBytes_zero`, `encodeNat_zero`,
+`encodeEmptyList_eq`, `singleton_size`, `concat_nil`) proved in
+`LeanKohaku/Invariants/Encoding.lean`. Full round-trip blocked on a
+non-`partial` decoder.
 
 ### 4.2 Hex roundtrip
 `decode ∘ encode = some` on byte arrays.
 
 **Prop:** `∀ b : ByteArray, Hex.decode (Hex.encode b) = some b`
-**Status:** 📝 stated — `LeanKohaku/Crypto/Hex.lean`
+**Status:** 🚧 in-progress — nibble-level round-trip and the digit/char tables
+are proved in `LeanKohaku/Invariants/Encoding.lean` (`hexDigit_*`,
+`nibbleToChar_*`, `nibble_round_trip_*`). Byte-level lift pending.
+
+### 4.4 JSON destructors agree with constructors
+The `as*` destructors used by the daemon dispatcher behave as left
+inverses of the matching constructors and reject mismatched shapes
+(e.g. `asString .null = none`).
+
+**Props:**
+- `asString (.str s) = some s`
+- `asArray (.arr xs) = some xs`
+- `asNat (.num (Int.ofNat n)) = some n`
+- `asNat (.num (-1)) = none`
+- `asString .null = none`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Encoding.lean`
 
 ### 4.3 Account policies are supported-chain/local-only
 The CLI supports regular BIP-39 k1 EOAs and local R1 smart accounts. Both
@@ -188,6 +207,50 @@ Sum of values shielded in = sum of notes created + fee.
 
 **Prop:** TBD
 **Status:** 📝 stated (future)
+
+### 5.7 Bridge methods are policy-classified
+Every method exposed by the kohaku-bridge sidecar is mapped to a
+`NetworkPolicy.Purpose`: broadcast methods to `shieldedBroadcast`,
+local introspection (`ping`, `version`, `listProtocols`) to
+`daemonControl`, and everything else to `shieldedRead`. `strictDaemonPolicy`
+denies every shielded purpose; `torDaemonPolicy` permits shielded purposes
+only over Tor to a configured node.
+
+**Props (proved):**
+- `methodPurpose "shielded.broadcast" = .shieldedBroadcast`
+- `methodPurpose "shielded.signAndBroadcast" = .shieldedBroadcast`
+- `methodPurpose "ping" = .daemonControl`
+- `∀ peer transport, strictDaemonPolicy { shieldedRead, … } = false`
+- `∀ peer transport, strictDaemonPolicy { shieldedBroadcast, … } = false`
+- `torDaemonPolicy { shieldedRead, … } = true → peer = configuredNode ∧ transport = tor`
+- `torDaemonPolicy { shieldedBroadcast, … } = true → peer = configuredNode ∧ transport = tor`
+
+**Status:** 🚧 in-progress — classification + strict/tor lemmas proved in
+`LeanKohaku/Invariants/Bridge.lean`. Runtime gate that *forces* every
+`Bridge.call` through `policyAllows` still pending.
+
+### 5.8 Bridge responses cannot be confused
+The JSON envelope `responseToJson` carries an `ok : Bool` that is `true`
+exactly for `Response.ok` and `false` for both `Response.err` and
+`Response.crash`. The daemon cannot mistake a sidecar crash for a
+successful proof.
+
+**Props (proved):**
+- `okField (responseToJson (.ok j))    = some true`
+- `okField (responseToJson (.err _ _ _)) = some false`
+- `okField (responseToJson (.crash _ _)) = some false`
+
+**Status:** ✅ proved — `LeanKohaku/Invariants/Bridge.lean`
+
+### 5.3 Bridge cannot return spending-key material
+`Bridge.Response` is an inductive type with no field of type
+`ByteArray` named for spending or viewing keys. Plaintext key material
+therefore cannot cross the Lean boundary, regardless of what the Node
+sidecar prints.
+
+**Status:** 🔒 by-construction — checked by inspection of
+`LeanKohaku/Privacy/Bridge.lean`. Will be machine-checked once a
+`ContainsKeyMaterial` predicate is added analogously to invariant 0.1.
 
 ### 5.9 CLI wallet actions preflight only through local daemon
 `balance` and `send` are validated locally, then classified as local daemon

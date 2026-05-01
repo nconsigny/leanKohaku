@@ -25,6 +25,8 @@ inductive Purpose where
   | metadataLookup
   | fiatOnramp
   | crashReport
+  | shieldedRead
+  | shieldedBroadcast
   deriving DecidableEq, Repr
 
 inductive Transport where
@@ -69,6 +71,8 @@ def torDaemonPolicy : Policy
   | { peer := .localNode, purpose := .broadcastTx, transport := .loopback } => true
   | { peer := .configuredNode, purpose := .nodeRead, transport := .tor } => true
   | { peer := .configuredNode, purpose := .broadcastTx, transport := .tor } => true
+  | { peer := .configuredNode, purpose := .shieldedRead, transport := .tor } => true
+  | { peer := .configuredNode, purpose := .shieldedBroadcast, transport := .tor } => true
   | _ => false
 
 /-- Deny-by-default helper for future features that have not been classified. -/
@@ -99,6 +103,8 @@ def Purpose.asString : Purpose → String
   | .metadataLookup => "metadata-lookup"
   | .fiatOnramp => "fiat-onramp"
   | .crashReport => "crash-report"
+  | .shieldedRead => "shielded-read"
+  | .shieldedBroadcast => "shielded-broadcast"
 
 def Transport.asString : Transport → String
   | .loopback => "loopback"
@@ -122,6 +128,8 @@ def parsePurpose : String → Option Purpose
   | "metadata-lookup" => some .metadataLookup
   | "fiat-onramp" => some .fiatOnramp
   | "crash-report" => some .crashReport
+  | "shielded-read" => some .shieldedRead
+  | "shielded-broadcast" => some .shieldedBroadcast
   | _ => none
 
 def parseTransport : String → Option Transport
@@ -141,7 +149,8 @@ def policyNames : List String := ["cli", "strict", "tor", "deny"]
 def peerNames : List String := ["local-daemon", "local-node", "configured-node", "third-party-api"]
 def purposeNames : List String :=
   ["daemon-control", "node-read", "broadcast-tx", "peer-discovery", "analytics",
-    "price-quote", "metadata-lookup", "fiat-onramp", "crash-report"]
+    "price-quote", "metadata-lookup", "fiat-onramp", "crash-report",
+    "shielded-read", "shielded-broadcast"]
 def transportNames : List String := ["loopback", "tor", "direct"]
 
 end LeanKohaku.Privacy.NetworkPolicy

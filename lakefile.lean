@@ -12,15 +12,33 @@ package "leanKohaku" where
     ⟨`autoImplicit, false⟩
   ]
 
-@[default_target]
 lean_lib LeanKohaku where
 
 @[default_target]
+lean_lib LeanKohakuClient where
+  roots := #[`LeanKohaku.Lib.Client]
+
+@[default_target]
+lean_lib LeanKohakuCore where
+  roots := #[`LeanKohaku.Lib.Core]
+
+@[default_target]
+lean_lib LeanKohakuSpec where
+  roots := #[`LeanKohaku.Lib.Spec]
+
+extern_lib liblean_uds pkg := do
+  let srcJob ← inputTextFile <| pkg.dir / "c" / "lean_uds" / "lean_uds.c"
+  let lean ← getLeanInstall
+  let oJob ← buildO (pkg.buildDir / "native" / "lean_uds.o") srcJob
+    #["-I", lean.includeDir.toString, "-fPIC"] #[]
+  buildStaticLib (pkg.buildDir / "native" / "liblean_uds.a") #[oJob]
+
+@[default_target]
 lean_exe leankohaku where
-  root := `Main
+  root := `LeanKohaku.App.Main
   supportInterpreter := true
 
 @[default_target]
 lean_exe «leankohaku-daemon» where
-  root := `DaemonMain
+  root := `LeanKohaku.App.DaemonMain
   supportInterpreter := true

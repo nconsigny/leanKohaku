@@ -1,0 +1,22 @@
+{
+  "name": "leankohaku-kohaku-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Untrusted Node sidecar exposing @kohaku-eth/{plugins,railgun,privacy-pools} to the leanKohaku daemon over JSON-RPC. Inputs and outputs are re-validated in Lean.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "bridge.mjs",
+  "bin": {
+    "leankohaku-kohaku-bridge": "bridge.mjs"
+  },
+  "dependencies": {
+    "@kohaku-eth/plugins": "0.0.1-alpha.7",
+    "@kohaku-eth/railgun": "0.0.1-alpha.12",
+    "@kohaku-eth/privacy-pools": "0.0.2-alpha.9"
+  },
+  "scripts": {
+    "start": "node bridge.mjs"
+  }
+}
