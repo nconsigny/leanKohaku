@@ -5,6 +5,8 @@ import LeanKohaku.Daemon.TxJournal
 import LeanKohaku.Daemon.Uds
 import LeanKohaku.Privacy.NetworkPolicy
 import LeanKohaku.Privacy.Bridge
+import LeanKohaku.Clearsign.Bridge
+import LeanKohaku.Daemon.TokenMeta
 import LeanKohaku.RPC.Outbound
 import LeanKohaku.RPC.Server
 import LeanKohaku.Ethereum.Address
@@ -40,6 +42,19 @@ open LeanKohaku.RPC.Server
 
 def defaultDerivationPath : String := "m/44'/60'/0'/0/0"
 
+/-- Resolve the default-account file path, owned by the daemon (CLI is a
+    thin forwarder). Honors `XDG_CONFIG_HOME`, falls back to `~/.config`,
+    finally `.` for testing without `HOME`. Same semantics the CLI used to
+    implement directly. -/
+private def defaultAccountPathIO : IO System.FilePath := do
+  let dir : System.FilePath ← match ← IO.getEnv "XDG_CONFIG_HOME" with
+    | some d => pure (System.FilePath.mk d)
+    | none =>
+        match ← IO.getEnv "HOME" with
+        | some h => pure (System.FilePath.mk h / ".config")
+        | none => pure (System.FilePath.mk ".")
+  pure (dir / "leankohaku" / "default-account.txt")
+
 /-- Decode a `0x`-prefixed hex string into `Nat`. Returns `none` on any
     non-hex character. Used to humanize hex receipt fields for the text
     summary; the wire JSON keeps raw hex. -/
@@ -66,6 +81,19 @@ private def formatGweiNat (n : Nat) : String :=
     let pad := String.mk (List.replicate (9 - str.length) '0')
     let trimmed := (pad ++ str).dropRightWhile (· = '0')
     s!"{whole}.{trimmed} gwei"
+
+private def formatEthNat (n : Nat) : String :=
+  let whole := n / 1000000000000000000
+  let frac := n % 1000000000000000000
+  if frac = 0 then s!"{whole} ETH"
+  else
+    let str := toString frac
+    let pad := String.mk (List.replicate (18 - str.length) '0')
+    let trimmed := (pad ++ str).dropRightWhile (· = '0')
+    s!"{whole}.{trimmed} ETH"
+
+private def humanEth (weiNat : Nat) : String :=
+  s!"{formatEthNat weiNat}  ({weiNat} wei)"
 
 /-- Render a hex-encoded wei amount as gwei, falling back to the raw hex
     if decode fails (so a malformed receipt never produces an empty field). -/
@@ -565,8 +593,13 @@ private def saveMnemonicSlot (params : Json) (generated : Option LeanKohaku.Wall
           pure (mnemonicFromPhrase phrase)
     let seed ← expectExcept <| ← LeanKohaku.Wallet.Mnemonic.mnemonicToSeedIO mnemonic ""
     let address ← expectExcept <| ← deriveAddressFromSeed seed derivationPath
+    -- Persist the mnemonic phrase encrypted under the same passphrase so
+    -- `eoa.revealMnemonic` can recover the words later. Words are joined
+    -- with single spaces (BIP-39 canonical form).
+    let phrase :=
+      String.intercalate " " mnemonic.words.toArray.toList
     let record ← expectExcept <| ← LeanKohaku.Wallet.EoaStore.saveEncryptedSeed
-      name passphrase seed derivationPath address
+      name passphrase seed derivationPath address (some phrase)
     pure (.ok (record, generated))
   catch e =>
     pure <| .error { invalidParams with data := some (.str e.toString) }
@@ -1057,7 +1090,7 @@ private def r1SendFlow (cfg : Config) (notify : LeanKohaku.Keystore.Tpm2Runtime.
                     (some (if success then "success" else "revert"))
                     (some blockNumber) (some gasUsed)
                   let summary :=
-                    s!"R1 send {txHash}\n  from: {account}\n  to: {to}\n  valueWei: {wei}\n  block: {humanBlock blockNumber}\n  gasUsed: {humanGas gasUsed}\n  effectiveGasPrice: {humanGwei effectiveGasPrice}\n  status: {if success then "success" else "revert"}\n"
+                    s!"R1 send {txHash}\n  from: {account}\n  to: {to}\n  value: {humanEth weiN}\n  block: {humanBlock blockNumber}\n  gasUsed: {humanGas gasUsed}\n  effectiveGasPrice: {humanGwei effectiveGasPrice}\n  status: {if success then "success" else "revert"}\n"
                   pure <| .ok <| .obj #[
                     ("text", .str summary),
                     ("exitCode", .num (Int.ofNat (if success then 0 else 1))),
@@ -1104,6 +1137,39 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
   | "daemon.shutdown" =>
       LeanKohaku.Daemon.State.requestShutdown state
       discard <| IO.asTask (exitSoon cfg.socketPath)
+      pure <| .ok <| .obj #[("ok", .bool true)]
+  | "account.getDefault" =>
+      -- Why: the default account is process-user state, not chain state, but
+      -- the daemon is the right owner because the CLI is supposed to be a
+      -- thin RPC forwarder (CLAUDE.md). File lives at
+      -- `$XDG_CONFIG_HOME/leankohaku/default-account.txt` falling back to
+      -- `~/.config/leankohaku/default-account.txt`. Returns `{ name: null }`
+      -- when unset; never throws, so first-run callers don't have to special
+      -- case missing files.
+      let path ← defaultAccountPathIO
+      if ← path.pathExists then
+        let raw ← try IO.FS.readFile path catch _ => pure ""
+        let trimmed := raw.trimAscii.toString
+        if trimmed.isEmpty then
+          pure <| .ok <| .obj #[("name", .null)]
+        else
+          pure <| .ok <| .obj #[("name", .str trimmed)]
+      else
+        pure <| .ok <| .obj #[("name", .null)]
+  | "account.setDefault" =>
+      match paramName req.params with
+      | .error err => pure (.error err)
+      | .ok name =>
+          let path ← defaultAccountPathIO
+          match path.parent with
+          | some parent => try IO.FS.createDirAll parent catch _ => pure ()
+          | none => pure ()
+          IO.FS.writeFile path (name ++ "\n")
+          pure <| .ok <| .obj #[("ok", .bool true), ("name", .str name)]
+  | "account.clearDefault" =>
+      let path ← defaultAccountPathIO
+      if ← path.pathExists then
+        try IO.FS.removeFile path catch _ => pure ()
       pure <| .ok <| .obj #[("ok", .bool true)]
   | "tpm.create" =>
       match paramName req.params with
@@ -1344,6 +1410,44 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
         | .ok (record, mnemonic?) => pure (.ok (← importResultJson state record mnemonic?))
       catch e =>
         pure <| .error { invalidParams with data := some (.str e.toString) }
+  | "eoa.revealMnemonic" =>
+      -- Why: passphrase-gated recovery of the BIP-39 words for slots
+      -- created with mnemonic retention. Slots that predate the on-disk
+      -- format change (`mnemonicWrap` absent) return -32030 with a
+      -- pointer to the underlying constraint (BIP-39 seed → words is
+      -- one-way). The plaintext is returned exactly once per call; we do
+      -- not journal, log, or notify.
+      match paramName req.params, paramString req.params "passphrase" with
+      | .ok name, .ok passphrase =>
+          match ← LeanKohaku.Wallet.EoaStore.load name with
+          | .error err =>
+              pure <| .error
+                { code := -32010,
+                  message := "EOA slot not found",
+                  data := some (.str err) }
+          | .ok record =>
+              match ← LeanKohaku.Wallet.EoaStore.unwrapMnemonic record passphrase with
+              | .error err =>
+                  -- Distinguish "no stored mnemonic" from "wrong passphrase"
+                  -- via prefix-match on the EoaStore error message — both
+                  -- are surfaced with -32030 but with different data so the
+                  -- TUI/CLI can render an appropriate message.
+                  pure <| .error
+                    { code := -32030,
+                      message := "could not reveal mnemonic",
+                      data := some (.str err) }
+              | .ok phrase =>
+                  let words := (phrase.splitOn " ").filter (· ≠ "")
+                  let arr : Array Json := words.foldl
+                    (fun acc w => acc.push (.str w)) (#[] : Array Json)
+                  pure <| .ok <| .obj #[
+                    ("name", .str name),
+                    ("address", .str record.address),
+                    ("derivationPath", .str record.derivationPath),
+                    ("wordCount", .num (Int.ofNat words.length)),
+                    ("mnemonic", .arr arr)
+                  ]
+      | _, _ => pure (.error invalidParams)
   | "eoa.unlock" =>
       match paramName req.params with
       | .error err => pure (.error err)
@@ -1644,6 +1748,85 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
   | "shielded.ping" =>
       let resp ← LeanKohaku.Privacy.Bridge.ping
       pure <| .ok <| LeanKohaku.Privacy.Bridge.responseToJson resp
+  | "clearsign.ping" =>
+      let resp ← LeanKohaku.Clearsign.Bridge.call
+        { method := "ping", params := .obj #[], id := 0 }
+      pure <| .ok <| LeanKohaku.Clearsign.Bridge.responseToJson resp
+  | "tx.simulate" =>
+      -- Why: dry-run a transaction against the RPC node before signing.
+      -- Combines eth_call (catches revert + returns return-data) and
+      -- eth_estimateGas (gas estimate). Both are policy-gated through
+      -- Outbound. The output is the load-bearing piece of Phase 2 clear-
+      -- signing: every signed tx must be simulated and the user must
+      -- confirm the simulated effect, not the LLM/dApp's prose summary.
+      match paramString req.params "to" with
+      | .error err => pure (.error err)
+      | .ok to =>
+          let data := paramStringD req.params "data" "0x"
+          let from? := getField "from" req.params >>= asString
+          let value := paramStringD req.params "value" "0x0"
+          let block := paramStringD req.params "block" "latest"
+          let chain? := getField "chain" req.params >>= asString
+          match endpointForChain cfg chain? with
+          | .error err =>
+              pure <| .error { code := -32021, message := "unknown chain", data := some (.str err) }
+          | .ok endpoint =>
+              -- Build the call object once; eth_call and eth_estimateGas
+              -- accept the same shape.
+              let txObj : Json := .obj <|
+                (match from? with | some f => #[("from", .str f)] | none => #[])
+                ++ #[("to", .str to), ("value", .str value), ("data", .str data)]
+              let callRes ← LeanKohaku.RPC.Outbound.call cfg.policy endpoint
+                .call (.arr #[txObj, .str block])
+              let gasRes ← LeanKohaku.RPC.Outbound.estimateGas
+                cfg.policy endpoint txObj block
+              let okBool := match callRes with | .ok _ => true | .error _ => false
+              let returnField : Array (String × Json) := match callRes with
+                | .ok j => #[("returnData", j)]
+                | .error _ => #[]
+              let revertField : Array (String × Json) := match callRes with
+                | .error e => #[("revertReason", Json.str e)]
+                | .ok _ => #[]
+              let gasField : Array (String × Json) := match gasRes with
+                | .ok j => #[("gasEstimate", j)]
+                | .error e =>
+                    -- Gas estimate failure on a successful eth_call is rare
+                    -- but possible (e.g. node is in archive-only mode); keep
+                    -- it informational rather than failing the whole call.
+                    #[("gasEstimateError", Json.str e)]
+              pure <| .ok <| .obj <| #[
+                ("ok", .bool okBool),
+                ("block", .str block),
+                ("tx", txObj)
+              ] ++ returnField ++ revertField ++ gasField
+  | "tx.decodeIntent" =>
+      -- Why: forwards { chainId, to, value, data, from? } to the clearsign
+      -- sidecar. Before forwarding, prefetch ERC-20 metadata for `to` so
+      -- the sidecar's tokenAmount formatter can render real decimals +
+      -- ticker. For non-ERC-20 contracts the eth_calls revert and the
+      -- cache stays empty — formatters fall back to the address tag.
+      let chainIdParam :=
+        ((getField "chainId" req.params) >>= asNat).getD cfg.chainId
+      let toParam :=
+        ((getField "to" req.params) >>= asString).getD ""
+      let mut tokenMeta : Json := .obj #[]
+      if !toParam.isEmpty then
+        let ep := cfg.rpcEndpoint
+        match ← LeanKohaku.Daemon.TokenMeta.lookupOrFetch
+            state cfg.policy ep chainIdParam toParam with
+        | some m =>
+            tokenMeta := .obj #[(toParam.toLower,
+              LeanKohaku.Daemon.TokenMeta.toJson m)]
+        | none => pure ()
+      let augmented : Json :=
+        match req.params with
+        | .obj fields =>
+            .obj (fields.filter (fun (k, _) => k != "tokenMetadata")
+              ++ #[("tokenMetadata", tokenMeta)])
+        | other => other
+      let resp ← LeanKohaku.Clearsign.Bridge.call
+        { method := "tx.decodeIntent", params := augmented, id := 0 }
+      pure <| .ok <| LeanKohaku.Clearsign.Bridge.responseToJson resp
   | "shielded.balance" =>
       match paramString req.params "passphrase" with
       | .error err => pure (.error err)

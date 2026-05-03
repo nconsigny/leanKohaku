@@ -12,12 +12,20 @@ pkgs.stdenv.mkDerivation rec {
     pkgs.cmake
     pkgs.ninja
     pkgs.clang
+    pkgs.nodejs_20
   ];
 
   buildPhase = ''
     runHook preBuild
     export HOME="$TMPDIR"
     lake build
+    # TUI bundle (Ink/React → single esbuild output). Skipped silently if
+    # tui/ is absent so the derivation still works for header-only checkouts.
+    if [ -d tui ]; then
+      ( cd tui && npm ci --offline --no-audit --no-fund 2>/dev/null || \
+                  npm install --no-audit --no-fund )
+      ( cd tui && npm run build )
+    fi
     runHook postBuild
   '';
 
@@ -25,6 +33,25 @@ pkgs.stdenv.mkDerivation rec {
     runHook preInstall
     install -Dm755 .lake/build/bin/leankohaku "$out/bin/leankohaku"
     install -Dm755 .lake/build/bin/leankohaku-daemon "$out/bin/leankohaku-daemon"
+    # Short alias users type interactively. Single binary on disk.
+    ln -s leankohaku "$out/bin/kohaku"
+
+    # Shell completion, generated from the binary so it tracks whatever
+    # commands the build actually exposes (no second source of truth).
+    install -dm755 "$out/share/bash-completion/completions"
+    "$out/bin/leankohaku" completion bash \
+        > "$out/share/bash-completion/completions/leankohaku"
+    ln -s leankohaku "$out/share/bash-completion/completions/kohaku"
+
+    install -dm755 "$out/share/zsh/site-functions"
+    "$out/bin/leankohaku" completion zsh \
+        > "$out/share/zsh/site-functions/_leankohaku"
+    ln -s _leankohaku "$out/share/zsh/site-functions/_kohaku"
+
+    if [ -f tui/dist/index.mjs ]; then
+      install -Dm644 tui/dist/index.mjs "$out/share/leankohaku/tui/index.mjs"
+    fi
+
     install -Dm644 packaging/systemd/leankohaku.socket "$out/lib/systemd/user/leankohaku.socket"
     install -Dm644 packaging/systemd/leankohaku.service "$out/lib/systemd/user/leankohaku.service"
     install -Dm644 README.md "$out/share/doc/leankohaku/README.md"

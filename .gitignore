@@ -7,3 +7,6 @@
 /artifacts
 /c/rustcrypto_helpers/target
 /bridge/node_modules/
+/bridge/clearsign/node_modules/
+/tui/node_modules/
+/tui/dist/

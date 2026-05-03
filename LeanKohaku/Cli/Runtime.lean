@@ -51,34 +51,30 @@ def runR1WalletCreate (keyName : String) : IO UInt32 := do
 def runSepoliaWalletList : IO UInt32 := do
   DaemonClient.printTextResult "tpm.listSepolia"
 
-/-! ## Default-account persistence -/
+/-! ## Default-account persistence
 
-/-- Resolve the default-account file path: `$XDG_CONFIG_HOME/leankohaku/default-account.txt`
-    falling back to `~/.config/leankohaku/default-account.txt`. -/
-def defaultAccountPath : IO System.FilePath := do
-  let dir : System.FilePath ← match ← IO.getEnv "XDG_CONFIG_HOME" with
-    | some d => pure (System.FilePath.mk d)
-    | none =>
-        match ← IO.getEnv "HOME" with
-        | some h => pure (System.FilePath.mk h / ".config")
-        | none => pure (System.FilePath.mk ".")
-  pure (dir / "leankohaku" / "default-account.txt")
+The daemon owns the file (`account.getDefault` / `account.setDefault`); the
+CLI is a thin forwarder per CLAUDE.md. These wrappers preserve the original
+function names so call sites don't have to change.
+
+When the daemon is unreachable (e.g. completion firing during install) the
+read silently returns `none` so users don't see daemon errors in their
+prompt; the write surfaces the daemon error since callers are explicitly
+asking to persist state. -/
 
 def readDefaultAccount : IO (Option String) := do
-  let p ← defaultAccountPath
-  if ← p.pathExists then
-    let raw ← try IO.FS.readFile p catch _ => pure ""
-    let trimmed := raw.trim
-    if trimmed.isEmpty then pure none else pure (some trimmed)
-  else
-    pure none
+  match ← DaemonClient.call "account.getDefault" with
+  | .ok r =>
+      match LeanKohaku.Encoding.Json.getField "name" r with
+      | some (LeanKohaku.Encoding.Json.Json.str s) =>
+          if s.isEmpty then pure none else pure (some s)
+      | _ => pure none
+  | .error _ => pure none
 
 def writeDefaultAccount (wallet : String) : IO Unit := do
-  let p ← defaultAccountPath
-  match p.parent with
-  | some parent => try IO.FS.createDirAll parent catch _ => pure ()
-  | none => pure ()
-  IO.FS.writeFile p (wallet ++ "\n")
+  let _ ← DaemonClient.call "account.setDefault"
+    (.obj #[("name", .str wallet)])
+  pure ()
 
 inductive SlotType where
   | eoa
@@ -120,6 +116,26 @@ def printAccountListNames : IO UInt32 := do
         let n := (LeanKohaku.Encoding.Json.getField "name" e
                   >>= LeanKohaku.Encoding.Json.asString).getD ""
         if !n.isEmpty then IO.println n
+  | .error _ => pure ()
+  pure 0
+
+/-- Print `<type>\t<name>` per line — type is `eoa` or `tpm`. Used by
+    completion so it can render the `<wallet>/<index>` subaccount form
+    only for EOA wallets (TPM/R1 keys have no derivation indices). -/
+def printAccountListTypedNames : IO UInt32 := do
+  match ← DaemonClient.call "eoa.list" with
+  | .ok r =>
+      for e in (LeanKohaku.Encoding.Json.asArray r).getD #[] do
+        let n := (LeanKohaku.Encoding.Json.getField "name" e
+                  >>= LeanKohaku.Encoding.Json.asString).getD ""
+        if !n.isEmpty then IO.println s!"eoa\t{n}"
+  | .error _ => pure ()
+  match ← DaemonClient.call "tpm.listSepoliaAddresses" with
+  | .ok r =>
+      for e in (LeanKohaku.Encoding.Json.asArray r).getD #[] do
+        let n := (LeanKohaku.Encoding.Json.getField "name" e
+                  >>= LeanKohaku.Encoding.Json.asString).getD ""
+        if !n.isEmpty then IO.println s!"tpm\t{n}"
   | .error _ => pure ()
   pure 0
 
@@ -1152,6 +1168,42 @@ def run (args : List String) : IO UInt32 := do
       | none =>
           IO.eprintln s!"error: unknown wallet '{name}'"
           return 2
+  | .walletReveal name =>
+      match ← resolveSlotType name with
+      | some .tpm =>
+          IO.eprintln s!"error: '{name}' is a TPM/R1 wallet — there is no BIP-39 mnemonic to reveal."
+          return 2
+      | none =>
+          IO.eprintln s!"error: unknown wallet '{name}'"
+          return 2
+      | some .eoa =>
+          IO.eprintln "⚠  About to print a BIP-39 mnemonic to your terminal."
+          IO.eprintln "   Anyone with these words controls the funds. Make sure no one is looking,"
+          IO.eprintln "   no screen recording is running, and clear scrollback after you copy them."
+          IO.eprint s!"   Type the wallet name '{name}' to confirm: "
+          let stdin ← IO.getStdin
+          let confirm ← stdin.getLine
+          let typed := confirm.trimRight
+          if typed != name then
+            IO.eprintln "aborted: confirmation did not match wallet name."
+            return 2
+          let passphrase ← Passphrase.read s!"Passphrase for {name}: "
+          match ← DaemonClient.call "eoa.revealMnemonic"
+              (.obj #[("name", .str name), ("passphrase", .str passphrase)]) with
+          | .error err =>
+              IO.eprintln s!"reveal failed: daemon error {err.code}: {err.message}"
+              return 2
+          | .ok result =>
+              let words := (LeanKohaku.Encoding.Json.getField "mnemonic" result
+                            >>= LeanKohaku.Encoding.Json.asArray).getD #[]
+              let phrase :=
+                String.intercalate " " <|
+                  (words.map fun w => (LeanKohaku.Encoding.Json.asString w).getD "").toList
+              IO.println ""
+              IO.println phrase
+              IO.println ""
+              IO.eprintln "✓ revealed. Clear your scrollback now (Ctrl-L is not enough)."
+              return 0
   | .walletDerive name path =>
       match ← resolveSlotType name with
       | some .tpm =>
@@ -1853,6 +1905,8 @@ def run (args : List String) : IO UInt32 := do
               return 0
   | .accountListNames =>
       printAccountListNames
+  | .accountListTypedNames =>
+      printAccountListTypedNames
   | .accountListIndices wallet? =>
       printAccountListIndices wallet?
   | .accountListWalletIndices withAddresses wallet? =>
@@ -1888,6 +1942,22 @@ def run (args : List String) : IO UInt32 := do
           IO.eprintln s!"daemon error {err.code}: {err.message}"
           pure 2
   | .shieldedDeposit walletName amountEth =>
+      -- Privacy Pools v1 deposit requires a secp256k1 EOA signer. TPM/R1
+      -- wallets hold P-256 keys behind a smart-account wrapper, which the
+      -- current daemon `shielded.deposit` path can't drive. Reject early
+      -- with a clear message instead of prompting for a passphrase the
+      -- TPM wallet doesn't have.
+      match ← resolveSlotType walletName with
+      | none =>
+          IO.eprintln s!"unknown wallet: {walletName}"
+          return 2
+      | some .tpm =>
+          IO.eprintln s!"'{walletName}' is a TPM/R1 wallet; shield deposits are only supported from EOA wallets today."
+          IO.eprintln "  The Privacy Pools v1 deposit path in the daemon needs a secp256k1 EOA signer."
+          IO.eprintln "  Use an EOA wallet, e.g.:  kohaku shield bbqTest 0.04"
+          IO.eprintln "  See `kohaku list` for the [eoa] entries."
+          return 2
+      | some .eoa => pure ()
       -- Two distinct secrets are involved here:
       --   1. The EOA slot's passphrase (decrypts the funding key in the daemon).
       --   2. The Privacy Pools mnemonic passphrase (encrypts the PP secret on disk).
@@ -1900,12 +1970,84 @@ def run (args : List String) : IO UInt32 := do
           pure 2
       | .ok _ =>
           let ppPass ← Passphrase.read "Privacy Pool passphrase: "
-          DaemonClient.printCall "shielded.deposit"
-            (.obj #[
-              ("name", .str walletName),
-              ("amountEth", .str amountEth),
-              ("passphrase", .str ppPass)
-            ])
+          match ← DaemonClient.call "shielded.deposit"
+              (.obj #[
+                ("name", .str walletName),
+                ("amountEth", .str amountEth),
+                ("passphrase", .str ppPass)
+              ]) with
+          | .error err =>
+              IO.eprintln s!"daemon error {err.code}: {err.message}"
+              pure 2
+          | .ok result =>
+              let getStr (j : LeanKohaku.Encoding.Json.Json) (k : String) : String :=
+                (LeanKohaku.Encoding.Json.getField k j
+                  >>= LeanKohaku.Encoding.Json.asString).getD ""
+              let getNatHex (j : LeanKohaku.Encoding.Json.Json) (k : String) : Nat :=
+                (hexWeiToNat (getStr j k)).getD 0
+              let sent := (LeanKohaku.Encoding.Json.getField "sent" result
+                           >>= LeanKohaku.Encoding.Json.asArray).getD #[]
+              if sent.isEmpty then
+                IO.eprintln "shielded.deposit returned no broadcast txs; raw response below:"
+                IO.eprintln (LeanKohaku.Encoding.Json.pretty result)
+                pure 1
+              else
+                IO.println "✓ Shielded deposit (Privacy Pools v1, Sepolia):"
+                IO.println ""
+                IO.println s!"  wallet:    {walletName}"
+                IO.println s!"  amount:    {amountEth} ETH"
+                IO.println ""
+                IO.println "  Transactions:"
+                let mut anyRevert := false
+                for tx in sent do
+                  let txHash := getStr tx "txHash"
+                  let status := getStr tx "status"
+                  let block  := getNatHex tx "blockNumber"
+                  let gas    := getNatHex tx "gasUsed"
+                  let price  := getNatHex tx "effectiveGasPrice"
+                  let value  :=
+                    -- value comes as decimal wei string in this payload
+                    match LeanKohaku.Encoding.Json.getField "value" tx
+                      >>= LeanKohaku.Encoding.Json.asString with
+                    | some s => s.toNat?.getD 0
+                    | none   => 0
+                  let mark :=
+                    match status with
+                    | "success" => "✓"
+                    | "revert"  => "✗"
+                    | _         => "·"
+                  IO.println s!"    {mark} {txHash}"
+                  IO.println s!"        status:   {status}"
+                  IO.println s!"        value:    {formatEth value}"
+                  IO.println s!"        block:    {block}"
+                  IO.println s!"        gasUsed:  {gas}  (effectivePrice {formatGwei price})"
+                  IO.println s!"        https://sepolia.etherscan.io/tx/{txHash}"
+                  if status == "revert" then anyRevert := true
+                -- Remaining balance for context.
+                match ← DaemonClient.call "eoa.list" with
+                | .ok r =>
+                    let entries := (LeanKohaku.Encoding.Json.asArray r).getD #[]
+                    let addr := entries.foldl (init := "") fun acc e =>
+                      if !acc.isEmpty then acc
+                      else
+                        let n := (LeanKohaku.Encoding.Json.getField "name" e
+                                  >>= LeanKohaku.Encoding.Json.asString).getD ""
+                        if n = walletName then
+                          (LeanKohaku.Encoding.Json.getField "address" e
+                            >>= LeanKohaku.Encoding.Json.asString).getD ""
+                        else acc
+                    if !addr.isEmpty then
+                      match ← DaemonClient.call "chain.balance"
+                          (.obj #[("address", .str addr)]) with
+                      | .ok b =>
+                          let hex := (LeanKohaku.Encoding.Json.getField "balance" b
+                                      >>= LeanKohaku.Encoding.Json.asString).getD "0x0"
+                          let wei := (hexWeiToNat hex).getD 0
+                          IO.println ""
+                          IO.println s!"  remaining: {formatEth wei}  ({walletName})"
+                      | .error _ => pure ()
+                | .error _ => pure ()
+                pure (if anyRevert then 1 else 0)
   | .shieldedWithdraw toRaw amountEth =>
       let toResult ← resolveAddressOrName toRaw
       let to :=
@@ -2009,6 +2151,57 @@ def run (args : List String) : IO UInt32 := do
       | _ =>
           IO.eprintln s!"unknown shell: {shell} (supported: bash, zsh)"
           return 2
+  | .tui =>
+      -- Locate the bundled TUI in this priority order:
+      --   1. $LEANKOHAKU_TUI_BIN          — explicit override (dev / packagers)
+      --   2. <appDir>/../share/leankohaku/tui/index.mjs — installed layout
+      --   3. <appDir>/../tui/dist/index.mjs            — repo dev layout
+      --   4. ./tui/dist/index.mjs (cwd)               — last-ditch dev fallback
+      let appDir ← IO.appDir
+      let installedBundle :=
+        appDir / ".." / "share" / "leankohaku" / "tui" / "index.mjs"
+      let devBundle := appDir / ".." / "tui" / "dist" / "index.mjs"
+      let cwdBundle : System.FilePath := "tui/dist/index.mjs"
+      let envBundle? ← IO.getEnv "LEANKOHAKU_TUI_BIN"
+      let bundle? : Option System.FilePath ← do
+        match envBundle? with
+        | some p =>
+            let fp : System.FilePath := p
+            if ← fp.pathExists then pure (some fp) else pure none
+        | none =>
+            if ← installedBundle.pathExists then pure (some installedBundle)
+            else if ← devBundle.pathExists then pure (some devBundle)
+            else if ← cwdBundle.pathExists then pure (some cwdBundle)
+            else pure none
+      match bundle? with
+      | none =>
+          IO.eprintln "leankohaku-tui bundle not found."
+          IO.eprintln ""
+          IO.eprintln "Looked for it in:"
+          IO.eprintln s!"  $LEANKOHAKU_TUI_BIN              ({(envBundle?.getD "<unset>")})"
+          IO.eprintln s!"  {installedBundle}"
+          IO.eprintln s!"  {devBundle}"
+          IO.eprintln s!"  {cwdBundle}"
+          IO.eprintln ""
+          IO.eprintln "Build it with:  cd tui && npm install && npm run build"
+          IO.eprintln "Or set LEANKOHAKU_TUI_BIN to a built dist/index.mjs."
+          pure 2
+      | some path =>
+          -- exec node on the bundle. We use spawn+wait rather than execv
+          -- so the Lean process can surface a non-zero exit code cleanly.
+          try
+            let child ← IO.Process.spawn
+              { cmd := "node",
+                args := #[path.toString],
+                stdin := .inherit,
+                stdout := .inherit,
+                stderr := .inherit }
+            let code ← child.wait
+            pure (UInt32.ofNat code.toNat)
+          catch e =>
+            IO.eprintln s!"failed to launch leankohaku-tui ({path}): {e.toString}"
+            IO.eprintln "Is `node` (≥20) installed and on PATH?"
+            pure 2
   | .invalid args =>
       match args with
       | "send" :: rest =>

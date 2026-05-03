@@ -132,11 +132,41 @@ def renderNotification (params : Json) : IO Unit := do
       let elapsed := (getField "elapsedSec" data >>= asNat).getD 0
       IO.println s!"⏳ Waiting for confirmation… ({elapsed}s)"
   | some "tx-mined" =>
-      let block := (getField "blockNumber" data >>= asString).getD "?"
-      let gasUsed := (getField "gasUsed" data >>= asString).getD "?"
-      let effPrice := (getField "effectiveGasPrice" data >>= asString).getD "?"
+      let parseHex (s : String) : Option Nat :=
+        let chars := s.toList
+        let body :=
+          match chars with
+          | '0' :: 'x' :: rest => rest
+          | '0' :: 'X' :: rest => rest
+          | _ => chars
+        body.foldl
+          (init := some 0)
+          (fun acc c =>
+            let d? : Option Nat :=
+              if '0' ≤ c && c ≤ '9' then some (c.toNat - '0'.toNat)
+              else if 'a' ≤ c && c ≤ 'f' then some (10 + c.toNat - 'a'.toNat)
+              else if 'A' ≤ c && c ≤ 'F' then some (10 + c.toNat - 'A'.toNat)
+              else none
+            match acc, d? with
+            | some n, some d => some (n * 16 + d)
+            | _, _ => none)
+      let blockHex := (getField "blockNumber" data >>= asString).getD ""
+      let gasHex := (getField "gasUsed" data >>= asString).getD ""
+      let priceHex := (getField "effectiveGasPrice" data >>= asString).getD ""
       let status := (getField "status" data >>= asString).getD "?"
-      IO.println s!"✓ Mined in block {block} — gasUsed={gasUsed}, effectivePrice={effPrice}, status={status}"
+      let block := (parseHex blockHex).getD 0
+      let gasUsed := (parseHex gasHex).getD 0
+      let priceWei := (parseHex priceHex).getD 0
+      let priceGweiWhole := priceWei / 1000000000
+      let priceGweiFrac := priceWei % 1000000000
+      let priceStr :=
+        if priceGweiFrac = 0 then s!"{priceGweiWhole} gwei"
+        else
+          let s := toString priceGweiFrac
+          let pad := String.mk (List.replicate (9 - s.length) '0')
+          let trimmed := (pad ++ s).dropRightWhile (· = '0')
+          s!"{priceGweiWhole}.{trimmed} gwei"
+      IO.println s!"✓ Mined in block {block} — gasUsed={gasUsed}, effectivePrice={priceStr}, status={status}"
   | some name =>
       IO.println s!"[event] {name} {compact data}"
   | none =>

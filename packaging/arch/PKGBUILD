@@ -7,11 +7,12 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/OWNER/leanKohaku"
 license=('custom:TBD')
 depends=('lean4')
-makedepends=('git' 'cmake' 'ninja' 'clang')
+makedepends=('git' 'cmake' 'ninja' 'clang' 'nodejs' 'npm')
 optdepends=(
   'tpm2-tools: optional Linux TPM2 provisioning and inspection outside Lean'
   'libfido2: optional FIDO2 security-key provisioning and inspection outside Lean'
   'fprintd: optional Linux biometric enrollment outside Lean'
+  'nodejs: required only for the interactive TUI (`kohaku tui`)'
 )
 _repo_url="https://github.com/OWNER/leanKohaku.git"
 source=("${pkgname}::git+${_repo_url}")
@@ -26,14 +27,44 @@ build() {
   cd "${srcdir}/${pkgname}"
   export HOME="${srcdir}/home"
   lake build
+  # TUI bundle (Ink/React, esbuild → single file). Failures here are
+  # non-fatal: the wallet works without `kohaku tui`.
+  if [ -d tui ]; then
+    pushd tui >/dev/null
+    npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
+    npm run build
+    popd >/dev/null
+  fi
 }
 
 package() {
   cd "${srcdir}/${pkgname}"
   install -Dm755 ".lake/build/bin/leankohaku" "${pkgdir}/usr/bin/leankohaku"
   install -Dm755 ".lake/build/bin/leankohaku-daemon" "${pkgdir}/usr/bin/leankohaku-daemon"
+  # Short alias users type interactively. Symlink keeps a single binary on disk.
+  ln -s leankohaku "${pkgdir}/usr/bin/kohaku"
+
+  # Shell completion. Generated from the binary so it stays in sync with
+  # whatever commands the build actually exposes — no second source of truth.
+  install -dm755 "${pkgdir}/usr/share/bash-completion/completions"
+  ".lake/build/bin/leankohaku" completion bash \
+      > "${pkgdir}/usr/share/bash-completion/completions/leankohaku"
+  ln -s leankohaku "${pkgdir}/usr/share/bash-completion/completions/kohaku"
+
+  install -dm755 "${pkgdir}/usr/share/zsh/site-functions"
+  ".lake/build/bin/leankohaku" completion zsh \
+      > "${pkgdir}/usr/share/zsh/site-functions/_leankohaku"
+  ln -s _leankohaku "${pkgdir}/usr/share/zsh/site-functions/_kohaku"
+
   install -Dm644 "packaging/systemd/leankohaku.socket" "${pkgdir}/usr/lib/systemd/user/leankohaku.socket"
   install -Dm644 "packaging/systemd/leankohaku.service" "${pkgdir}/usr/lib/systemd/user/leankohaku.service"
+
+  # TUI bundle. The launcher in Cli/Runtime.lean looks here first
+  # (<appDir>/../share/leankohaku/tui/index.mjs) — keep this path in sync
+  # if you move it.
+  if [ -f tui/dist/index.mjs ]; then
+    install -Dm644 "tui/dist/index.mjs" "${pkgdir}/usr/share/leankohaku/tui/index.mjs"
+  fi
   install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
   install -Dm644 "INVARIANTS.md" "${pkgdir}/usr/share/doc/${pkgname}/INVARIANTS.md"
   install -Dm644 "SECURITY.md" "${pkgdir}/usr/share/doc/${pkgname}/SECURITY.md"

@@ -1,0 +1,33 @@
+{
+  "name": "leankohaku-tui",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Ink-based interactive sidecar for the leanKohaku wallet daemon. Holds no secrets — every wallet operation is dispatched to the Lean daemon over the same UDS JSON-RPC socket the CLI uses.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/index.mjs",
+  "bin": {
+    "leankohaku-tui": "dist/index.mjs"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "dev": "node --import tsx/esm src/index.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ink": "^5.0.1",
+    "ink-select-input": "^6.0.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/react": "^18.3.11",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2"
+  }
+}

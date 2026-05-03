@@ -1,0 +1,62 @@
+{
+  "$schema": "../specs/erc7730-v1.schema.json",
+  "context": {
+    "$id": "UniswapV3SwapRouter02",
+    "contract": {
+      "deployments": [
+        { "chainId": 1,        "address": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45" },
+        { "chainId": 11155111, "address": "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E" }
+      ],
+      "abi": [
+        { "type": "function", "name": "exactInputSingle", "inputs": [
+          { "name": "params", "type": "tuple", "components": [
+            { "name": "tokenIn",           "type": "address" },
+            { "name": "tokenOut",          "type": "address" },
+            { "name": "fee",               "type": "uint24"  },
+            { "name": "recipient",         "type": "address" },
+            { "name": "amountIn",          "type": "uint256" },
+            { "name": "amountOutMinimum",  "type": "uint256" },
+            { "name": "sqrtPriceLimitX96", "type": "uint160" }
+          ] }
+        ] },
+        { "type": "function", "name": "exactInput", "inputs": [
+          { "name": "params", "type": "tuple", "components": [
+            { "name": "path",             "type": "bytes"   },
+            { "name": "recipient",        "type": "address" },
+            { "name": "amountIn",         "type": "uint256" },
+            { "name": "amountOutMinimum", "type": "uint256" }
+          ] }
+        ] }
+      ]
+    }
+  },
+  "metadata": {
+    "owner": "Uniswap Labs",
+    "info": { "url": "https://docs.uniswap.org/contracts/v3/reference/periphery/SwapRouter" },
+    "contractName": "Uniswap V3 SwapRouter02"
+  },
+  "display": {
+    "formats": {
+      "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))": {
+        "intent": "Swap tokens (Uniswap V3, single hop)",
+        "fields": [
+          { "path": "params.tokenIn",          "label": "Token in",     "format": "addressName" },
+          { "path": "params.tokenOut",         "label": "Token out",    "format": "addressName" },
+          { "path": "params.amountIn",         "label": "Amount in",    "format": "tokenAmount", "params": { "tokenPath": "params.tokenIn" } },
+          { "path": "params.amountOutMinimum", "label": "Min out",      "format": "tokenAmount", "params": { "tokenPath": "params.tokenOut" } },
+          { "path": "params.recipient",        "label": "Recipient",    "format": "addressName" },
+          { "path": "params.fee",              "label": "Pool fee",     "format": "raw" }
+        ]
+      },
+      "exactInput((bytes,address,uint256,uint256))": {
+        "intent": "Swap tokens (Uniswap V3, multi-hop)",
+        "fields": [
+          { "path": "params.path",             "label": "Path (encoded)", "format": "raw" },
+          { "path": "params.amountIn",         "label": "Amount in",      "format": "raw" },
+          { "path": "params.amountOutMinimum", "label": "Min out",        "format": "raw" },
+          { "path": "params.recipient",        "label": "Recipient",      "format": "addressName" }
+        ]
+      }
+    }
+  }
+}

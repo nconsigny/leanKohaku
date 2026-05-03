@@ -39,6 +39,12 @@ structure Record where
   -- without this field continue to work; only `wallet unlock --all --biometric`
   -- requires it.
   attestationWrap : Option ByteArray := none
+  -- Why: optional ChaCha20-Poly1305 ciphertext of the BIP-39 mnemonic phrase
+  -- (UTF-8 bytes of the space-joined words) under the same passphrase-derived
+  -- key as the seed but with a distinct AAD and fresh nonce. Layout =
+  -- nonce(12) || ciphertext+tag. Slots created before this field landed have
+  -- `none` here and cannot be revealed (BIP-39 seed → words is one-way).
+  mnemonicWrap : Option ByteArray := none
 
 def defaultKdfIters : Nat := 100000
 
@@ -93,9 +99,13 @@ def Record.toJson (r : Record) : Json :=
     ("createdAt", .num (Int.ofNat r.createdAt)),
     ("accounts", .arr (r.accounts.map Account.toJson))
   ]
-  match r.attestationWrap with
-  | none => .obj base
-  | some w => .obj (base.push ("attestationWrap", hex w))
+  let withAttest :=
+    match r.attestationWrap with
+    | none => base
+    | some w => base.push ("attestationWrap", hex w)
+  match r.mnemonicWrap with
+  | none => .obj withAttest
+  | some w => .obj (withAttest.push ("mnemonicWrap", hex w))
 
 private def fieldString (obj : Json) (key : String) : Except String String :=
   match getField key obj >>= asString with
@@ -143,6 +153,9 @@ def Record.fromJson (json : Json) : Except String Record := do
     | some _ => .error "accounts field must be a JSON array"
   -- Why: missing field → None; preserves backward compat with pre-attestation slot files.
   let attestationWrap : Option ByteArray := getField "attestationWrap" json >>= asBytes
+  -- Why: same lazy migration story as attestationWrap. Slots written before
+  -- mnemonic retention have `none` here.
+  let mnemonicWrap : Option ByteArray := getField "mnemonicWrap" json >>= asBytes
   if version != 1 then
     .error s!"unsupported EOA store version: {version}"
   else if kdfSalt.size = 0 then
@@ -161,7 +174,8 @@ def Record.fromJson (json : Json) : Except String Record := do
       address := address,
       createdAt := createdAt,
       accounts := accounts,
-      attestationWrap := attestationWrap
+      attestationWrap := attestationWrap,
+      mnemonicWrap := mnemonicWrap
     }
 
 private def deriveKey (passphrase : String) (salt : ByteArray) (iters : Nat) :
@@ -175,8 +189,57 @@ private def deriveKey (passphrase : String) (salt : ByteArray) (iters : Nat) :
 private def aad (name derivationPath address : String) : ByteArray :=
   (name ++ "\n" ++ derivationPath ++ "\n" ++ address).toByteArray
 
+-- Why: distinct AAD prevents an attacker who can swap fields in the slot
+-- JSON from reusing the seed ciphertext as the mnemonic ciphertext (or vice
+-- versa). The same passphrase-derived key is used for both, but a fresh
+-- nonce + this AAD make the two ciphertexts unforgeable for cross-use.
+private def mnemonicAad (name derivationPath address : String) : ByteArray :=
+  ("mnemonic\n" ++ name ++ "\n" ++ derivationPath ++ "\n" ++ address).toByteArray
+
+/-- Seal the mnemonic phrase under the same passphrase-derived key as the
+    seed, with a fresh 12-byte nonce. Returns `nonce(12) || ciphertext+tag`. -/
+private def sealMnemonic (key : ByteArray) (name derivationPath address phrase : String) :
+    IO (Except String ByteArray) := do
+  let nonce ← LeanKohaku.Crypto.Random.getRandomBytes 12
+  match ← LeanKohaku.Crypto.Hacl.chacha20Poly1305SealIO
+      (LeanKohaku.Crypto.Hex.encode key)
+      (LeanKohaku.Crypto.Hex.encode nonce)
+      (LeanKohaku.Crypto.Hex.encode (mnemonicAad name derivationPath address))
+      (LeanKohaku.Crypto.Hex.encode phrase.toByteArray) with
+  | .error err => pure (.error err)
+  | .ok ct => pure (.ok (nonce ++ ct))
+
+/-- Open a `nonce(12) || ciphertext+tag` mnemonic wrap, returning the
+    UTF-8 plaintext phrase. -/
+def unwrapMnemonic (record : Record) (passphrase : String) :
+    IO (Except String String) := do
+  match record.mnemonicWrap with
+  | none =>
+      pure (.error "this slot has no stored mnemonic — created before mnemonic retention; only the raw seed can be recovered")
+  | some wrap =>
+      if wrap.size < 12 then
+        pure (.error "mnemonicWrap too short")
+      else
+        match ← deriveKey passphrase record.kdfSalt record.kdfIters with
+        | .error err => pure (.error err)
+        | .ok key =>
+            let nonce := wrap.extract 0 12
+            let ct := wrap.extract 12 wrap.size
+            match ← LeanKohaku.Crypto.Hacl.chacha20Poly1305OpenIO
+                (LeanKohaku.Crypto.Hex.encode key)
+                (LeanKohaku.Crypto.Hex.encode nonce)
+                (LeanKohaku.Crypto.Hex.encode
+                  (mnemonicAad record.name record.derivationPath record.address))
+                (LeanKohaku.Crypto.Hex.encode ct) with
+            | .error err => pure (.error err)
+            | .ok bytes =>
+                match String.fromUTF8? bytes with
+                | some s => pure (.ok s)
+                | none => pure (.error "stored mnemonic is not valid UTF-8")
+
 def makeRecord (name passphrase : String) (seed : ByteArray)
-    (derivationPath address : String) : IO (Except String Record) := do
+    (derivationPath address : String)
+    (mnemonicPhrase? : Option String := none) : IO (Except String Record) := do
   let salt ← LeanKohaku.Crypto.Random.getRandomBytes 16
   let nonce ← LeanKohaku.Crypto.Random.getRandomBytes 12
   let key ← deriveKey passphrase salt defaultKdfIters
@@ -191,6 +254,18 @@ def makeRecord (name passphrase : String) (seed : ByteArray)
       match sealed with
       | .error err => pure (.error err)
       | .ok ciphertext =>
+          let mnemonicWrap? : Option ByteArray ←
+            match mnemonicPhrase? with
+            | none => pure none
+            | some phrase =>
+                match ← sealMnemonic keyBytes name derivationPath address phrase with
+                | .error _ =>
+                    -- Why: failing to seal the mnemonic must NOT fail the
+                    -- whole create. The seed is sealed already; the worst
+                    -- outcome is that this slot has no recoverable
+                    -- mnemonic, same as a legacy slot.
+                    pure none
+                | .ok wrap => pure (some wrap)
           pure <| .ok {
             version := 1,
             name := name,
@@ -201,7 +276,8 @@ def makeRecord (name passphrase : String) (seed : ByteArray)
             derivationPath := derivationPath,
             address := address,
             createdAt := ← IO.monoMsNow,
-            accounts := #[{ index := 0, path := derivationPath, address := address, label := none }]
+            accounts := #[{ index := 0, path := derivationPath, address := address, label := none }],
+            mnemonicWrap := mnemonicWrap?
           }
 
 def save (record : Record) : IO Unit := do
@@ -211,8 +287,9 @@ def save (record : Record) : IO Unit := do
   IO.setAccessRights path fileMode
 
 def saveEncryptedSeed (name passphrase : String) (seed : ByteArray)
-    (derivationPath address : String) : IO (Except String Record) := do
-  match ← makeRecord name passphrase seed derivationPath address with
+    (derivationPath address : String)
+    (mnemonicPhrase? : Option String := none) : IO (Except String Record) := do
+  match ← makeRecord name passphrase seed derivationPath address mnemonicPhrase? with
   | .error err => pure (.error err)
   | .ok record =>
       save record

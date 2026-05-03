@@ -14,6 +14,11 @@ structure UnlockedSlot where
   unlockedAtMs   : Nat
   ttlMs          : Nat
 
+/-- Cached ERC-20 metadata. The actual struct lives in
+`LeanKohaku.Daemon.TokenMeta`; we store `(decimals, symbol)` raw to avoid
+a circular import. -/
+abbrev TokenMetaEntry := Nat × String
+
 structure DaemonState where
   startedAtMs : Nat
   shuttingDown : Bool := false
@@ -24,6 +29,9 @@ structure DaemonState where
   between chunks and aborts at the next safe point.
   -/
   scanCancelled : Bool := false
+  /-- ERC-20 metadata cache keyed by `"chainId:address"` (lowercased
+  address). Populated on demand by `tx.decodeIntent`. -/
+  tokenMeta : List (String × TokenMetaEntry) := []
 
 abbrev Shared := IO.Ref DaemonState
 

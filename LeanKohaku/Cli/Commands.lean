@@ -223,6 +223,7 @@ inductive Command where
   | walletLock (name : String)
   | walletLockAll
   | walletDelete (name : String)
+  | walletReveal (name : String)
   | walletDerive (name path : String)
   | walletSignDigest (name digest : String)
   | walletSignMessage (name message : String) (path? : Option String)
@@ -271,6 +272,7 @@ inductive Command where
   | accountUse (wallet : String)
   | accountCurrent
   | accountListNames
+  | accountListTypedNames
   | accountListIndices (wallet? : Option String)
   | accountListWalletIndices (withAddresses : Bool) (wallet? : Option String)
   | shieldedBalance
@@ -280,6 +282,7 @@ inductive Command where
   | shieldedImport (mnemonic : String)
   | shieldedDelete
   | completion (shell : String)
+  | tui
   | resolve (name : String)
   | invalid (args : List String)
   deriving Repr
@@ -406,6 +409,7 @@ def parse : List String → Command
   | ["wallet", "lock", "-a"] => .walletLockAll
   | ["wallet", "lock", name] => .walletLock name
   | ["wallet", "delete", name] => .walletDelete name
+  | ["wallet", "reveal", name] => .walletReveal name
   | ["wallet", "derive", name, path] => .walletDerive name path
   | ["wallet", "sign-digest", name, digest] => .walletSignDigest name digest
   | ["wallet", "sign-message", name, message] => .walletSignMessage name message none
@@ -487,6 +491,7 @@ def parse : List String → Command
   | ["wallet", "use", wallet] => .accountUse wallet
   | ["wallet", "current"] => .accountCurrent
   | ["wallet", "list-names"] => .accountListNames
+  | ["wallet", "list-typed-names"] => .accountListTypedNames
   | ["wallet", "list-indices"] => .accountListIndices none
   | ["wallet", "list-indices", wallet] => .accountListIndices (some wallet)
   | ["wallet", "list-walletindices"] => .accountListWalletIndices false none
@@ -501,6 +506,8 @@ def parse : List String → Command
   | ["shield", walletName, amountEth] => .shieldedDeposit walletName amountEth
   | ["unshield", to, amountEth] => .shieldedWithdraw to amountEth
   | ["completion", shell]  => .completion shell
+  | ["tui"]                => .tui
+  | ["ui"]                 => .tui
   | ["resolve", name]      => .resolve name
   | args                  => .invalid args
 
@@ -783,7 +790,9 @@ def helpText : String :=
      list | list -a                      Tree view of EOA + TPM/R1 wallets.\n\
      wallet use <wallet>                 Set default wallet for `send`.\n\
      wallet current                      Print current default wallet.\n\
-     resolve <name>                      Resolve an ENS name to an address.\n\n\
+     resolve <name>                      Resolve an ENS name to an address.\n\
+     tui | ui                            Open the interactive Ink-based UI\n\
+                                         (arrow-key navigation, requires Node ≥20).\n\n\
    SETUP / WALLET MANAGEMENT:\n\
      wallet create eoa <name> [path]     Create an encrypted EOA slot.\n\
      wallet create r1 <name>             Create a TPM2-wrapped P-256 key.\n\
@@ -795,6 +804,9 @@ def helpText : String :=
      wallet unlock <name>                EOA: passphrase prompt; R1: no-op.\n\
      wallet lock <name>                  Lock a wallet.\n\
      wallet delete <name>                Delete a wallet (passphrase required for EOA).\n\
+     wallet reveal <name>                Print the BIP-39 mnemonic of an EOA (DANGER).\n\
+                                         Requires passphrase + name confirmation.\n\
+                                         Only works for slots created with mnemonic retention.\n\
      wallet derive <name> <path>         Derive an extra path (EOA only).\n\
      wallet sign-digest <name> <hash>    Sign a 32-byte digest. Both types.\n\
      wallet sign-message <name> [path] <msg>\n\
@@ -853,7 +865,7 @@ def bashCompletion : String :=
     "_leankohaku_complete() {",
     "  local cur",
     "  cur=\"${COMP_WORDS[COMP_CWORD]}\"",
-    "  local top=\"help version policy network doctor wallet shield unshield daemon balance list send from chain debug resolve\"",
+    "  local top=\"help version policy network doctor wallet shield unshield daemon balance list send from chain debug resolve tui ui\"",
     "  # If we're completing the value after --account, decide whether the value",
     "  # is a wallet name (e.g. for `daemon <wallet> send`) or a sub-account index",
     "  # (e.g. for `send` and `eoa send|sign-*|send-wei`).",
@@ -892,7 +904,9 @@ def bashCompletion : String :=
     "      _is_index=1",
     "    fi",
     "    if [ \"$_is_index\" = \"1\" ]; then",
-    "      # Two-stage UX: <wallet>/<index>. Detect by presence of a slash.",
+    "      # Two-stage UX: EOA wallets get `<wallet>/<index>` (sub-account form);",
+    "      # TPM/R1 wallets are bare names (no derivation indices). Wallet type",
+    "      # is read from `wallet list-typed-names` which emits `<type>\\t<name>`.",
     "      case \"$_cur\" in",
     "        */*)",
     "          local _w=\"${_cur%%/*}\"",
@@ -904,12 +918,20 @@ def bashCompletion : String :=
     "          COMPREPLY=( $(compgen -W \"$entries\" -- \"${_w}/${_suffix}\") )",
     "          ;;",
     "        *)",
-    "          local names slashed",
-    "          names=\"$(\"${COMP_WORDS[0]}\" wallet list-names 2>/dev/null)\"",
-    "          slashed=\"\"",
-    "          for n in $names; do slashed+=\"${n}/ \"; done",
-    "          COMPREPLY=( $(compgen -W \"$slashed\" -- \"$_cur\") )",
-    "          # Don't append a space so the user keeps typing past the slash.",
+    "          local _typed _t _n _eoa=\"\" _tpm=\"\"",
+    "          _typed=\"$(\"${COMP_WORDS[0]}\" wallet list-typed-names 2>/dev/null)\"",
+    "          while IFS=$'\\t' read -r _t _n; do",
+    "            [ -z \"$_n\" ] && continue",
+    "            case \"$_t\" in",
+    "              eoa) _eoa+=\"${_n}/ \" ;;",
+    "              tpm) _tpm+=\"${_n} \" ;;",
+    "            esac",
+    "          done <<< \"$_typed\"",
+    "          # EOA: trailing slash (more typing follows). TPM: bare name.",
+    "          # We can't mix nospace/space in a single COMPREPLY, so prefer",
+    "          # nospace (safe: an EOA insert ends in `/`, a TPM insert in a",
+    "          # bare name — the user adds their own space when they're done).",
+    "          COMPREPLY=( $(compgen -W \"${_eoa}${_tpm}\" -- \"$_cur\") )",
     "          compopt -o nospace 2>/dev/null",
     "          ;;",
     "      esac",
@@ -932,7 +954,7 @@ def bashCompletion : String :=
     "  fi",
     "  case \"${COMP_WORDS[1]}\" in",
     "    wallet)",
-    "      if [ \"$COMP_CWORD\" -eq 2 ]; then COMPREPLY=( $(compgen -W \"create import deploy list show address unlock lock delete derive sign-digest sign-message sign-tx sign-typed-data history account use current\" -- \"$cur\") );",
+    "      if [ \"$COMP_CWORD\" -eq 2 ]; then COMPREPLY=( $(compgen -W \"create import deploy list show address unlock lock delete reveal derive sign-digest sign-message sign-tx sign-typed-data history account use current\" -- \"$cur\") );",
     "      elif [ \"$COMP_CWORD\" -eq 3 ] && [ \"${COMP_WORDS[2]}\" = \"create\" ]; then COMPREPLY=( $(compgen -W \"eoa r1\" -- \"$cur\") );",
     "      elif [ \"$COMP_CWORD\" -eq 3 ] && [ \"${COMP_WORDS[2]}\" = \"account\" ]; then COMPREPLY=( $(compgen -W \"add list rm\" -- \"$cur\") );",
     "      elif [ \"$COMP_CWORD\" -ge 4 ] && [ \"${COMP_WORDS[2]}\" = \"account\" ]; then",
@@ -943,7 +965,7 @@ def bashCompletion : String :=
     "          show|address|unlock|lock|history|list)",
     "            local names; names=\"$(\"${COMP_WORDS[0]}\" wallet list-names 2>/dev/null)\"",
     "            COMPREPLY=( $(compgen -W \"$names --all -a\" -- \"$cur\") ) ;;",
-    "          deploy|delete|derive|sign-digest|sign-message|sign-tx|sign-typed-data|use)",
+    "          deploy|delete|reveal|derive|sign-digest|sign-message|sign-tx|sign-typed-data|use)",
     "            local names; names=\"$(\"${COMP_WORDS[0]}\" wallet list-names 2>/dev/null)\"",
     "            COMPREPLY=( $(compgen -W \"$names\" -- \"$cur\") ) ;;",
     "        esac;",
@@ -1063,13 +1085,17 @@ def zshAccountOverride : String :=
     "      done < <(\"$_bin\" wallet list-walletindices --addresses \"$_w\" 2>/dev/null)",
     "      _describe -t accounts 'account' _disp _pairs",
     "    else",
-    "      local -a _names _slashed",
-    "      local _n",
-    "      while IFS= read -r _n; do",
+    "      # EOA → `<name>/` (sub-account form follows). TPM → bare `<name>`.",
+    "      local -a _entries",
+    "      local _t _n",
+    "      while IFS=$'\\t' read -r _t _n; do",
     "        [[ -z \"$_n\" ]] && continue",
-    "        _slashed+=(\"${_n}/\")",
-    "      done < <(\"$_bin\" wallet list-names 2>/dev/null)",
-    "      compadd -S '' -- \"${_slashed[@]}\"",
+    "        case \"$_t\" in",
+    "          eoa) _entries+=(\"${_n}/\") ;;",
+    "          tpm) _entries+=(\"$_n\") ;;",
+    "        esac",
+    "      done < <(\"$_bin\" wallet list-typed-names 2>/dev/null)",
+    "      compadd -S '' -- \"${_entries[@]}\"",
     "    fi",
     "  else",
     "    local -a _names",
