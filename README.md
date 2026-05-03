@@ -1,11 +1,8 @@
 # leanKohaku
 
 A formally-verified Ethereum wallet daemon written entirely in **Lean 4**,
-with a CLI-first surface. Inspired by [`kohaku-ai`][upstream] (TypeScript)
-but re-architected from the ground up for machine-checked proofs of the
+with a CLI-first surface. Zrchitected from the ground up for machine-checked proofs of the
 critical signing path.
-
-[upstream]: https://github.com/jiayaoqijia/kohaku-ai
 
 ## Goals
 
