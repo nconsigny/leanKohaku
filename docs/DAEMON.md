@@ -98,6 +98,9 @@ Daemon-specific errors currently include:
 - `-32012` EOA slot locked
 - `-32013` EOA signing failed
 - `-32020` chain RPC failed
+- `-32021` unknown chain (chain key missing from `chainEndpoints`)
+- `-32030` ENS resolution: no `ens_rpc_url` configured
+- `-32043` TPM sign failed (e.g. fprintd biometric verification failed)
 
 ## Methods
 
@@ -106,6 +109,14 @@ Daemon:
 - `daemon.ping`
 - `daemon.version`
 - `daemon.shutdown`
+- `daemon.preflight` — params `{method: "balance"|"send", address?, to?, amountWei?}` → `{ok, summary, plan}`. The CLI's `printPreflight` is a thin wrapper.
+
+Account-state (workstation-local, owned by daemon — file lives at `$XDG_CONFIG_HOME/leankohaku/default-account.txt`):
+
+- `account.getDefault` → `{name: string|null}`
+- `account.setDefault` (params `{name}`) → `{ok, name}`
+- `account.clearDefault` → `{ok: true}`
+- `account.list` → `{accounts: [{type: "eoa"|"tpm", name, address, indices?}]}` — single unified view used by the TUI's wallet list and CLI completion helpers.
 
 TPM/R1 compatibility:
 
@@ -113,11 +124,12 @@ TPM/R1 compatibility:
 - `tpm.deploy` (params: `name`, `chain` ∈ {`sepolia`, `mainnet`})
 - `tpm.createSepolia` (DEPRECATED alias for `tpm.create`)
 - `tpm.listSepolia`
+- `tpm.listSepoliaAddresses`
 - `tpm.signSepolia`
 - `r1.sendSepolia`
 - `r1.sendEthSepolia`
 
-Chain RPC:
+Chain RPC (all policy-gated through `Privacy.NetworkPolicy`):
 
 - `chain.balance`
 - `chain.nonce`
@@ -125,6 +137,7 @@ Chain RPC:
 - `chain.maxPriorityFeePerGas`
 - `chain.estimateGas`
 - `chain.tokenBalance`
+- `chain.ethCall` — general policy-gated `eth_call` (params `{to, data, block?, chain?}`). Used by the LLM sidecar's read tools (`get_aave_health_factor`, `get_uniswap_v3_quote`, `get_morpho_blue_position`); any future protocol-read tool should encode calldata via viem and route through here.
 - `chain.sendRawTransaction`
 
 EOA:
@@ -140,12 +153,20 @@ EOA:
 - `eoa.signDigest`
 - `eoa.signMessage`
 - `eoa.signTx`
+- `eoa.signTypedData`
 - `eoa.send`
 - `eoa.delete`
+- `eoa.account.{list,add,rm}`
 
-Shielded bridge:
+Sidecar bridges (all policy-gated; one-shot spawn per call):
 
-- `shielded.ping`
+- `shielded.*` — Privacy Pools / Railgun (`bridge/`).
+- `clearsign.ping`
+- `tx.decodeIntent` — params `{chainId, to, value, data, from?}` → ERC-7730 descriptor walker. Daemon prefetches ERC-20 metadata for the `to` address and threads it into the bridge call as `tokenMetadata` so amount fields render with real decimals + ticker. Falls back to a bundled 4byte dictionary when no descriptor matches.
+- `eip712.decodeIntent` — params `{chainId, domain, types, primaryType, message}` → walks `display.formats[encodeType]` for the matching descriptor (e.g. CowSwap order). Daemon prefetches token metadata for any address-shaped fields in `message`.
+- `tx.simulate` — params `{chainId?, from?, to, value?, data, block?, chain?, trace?}` → `{ok, block, tx, returnData?, revertReason?, gasEstimate?, gasEstimateError?, trace?, traceUnavailable?, tokenMetadata?}`. With `trace: true` the daemon runs `debug_traceCall` (`callTracer + withLog`), walks the trace for ERC-20 Transfer events, and prefetches token metadata for every emitting address — TUI's `TransfersBlock` then renders "0.1 USDC" rows.
+- `llm.ping`
+- `tx.draftFromIntent` — params `{prompt, chainId, fromAddr?}` → `{candidates: [{to, value, data, rationale, confidence, ...}]}`. Sidecar tries a rule-based matcher first; falls through to an Anthropic Claude tool-use loop when `ANTHROPIC_API_KEY` is set in the daemon's env. Every emitted draft must flow through `tx.decodeIntent` + `tx.simulate` + a user-confirm step before signing — the daemon never signs based on this output directly.
 
 ## Regression Checks
 

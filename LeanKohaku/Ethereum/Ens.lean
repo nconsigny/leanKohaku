@@ -112,7 +112,9 @@ structure Resolved where
       - `.ok r` on success.
       - `.error (code, msg)` where code is the JSON-RPC error code to surface. -/
 def resolveIO (policy : Policy) (endpoint : LeanKohaku.RPC.Outbound.Endpoint)
-    (chainId : Nat) (name : String) : IO (Except (Int × String) Resolved) := do
+    (chainId : Nat) (name : String)
+    (via? : Option LeanKohaku.RPC.Outbound.VerifyVia := none) :
+    IO (Except (Int × String) Resolved) := do
   match registryFor chainId with
   | none => pure (.error (-32027, s!"ENS not configured for chainId {chainId}"))
   | some registry =>
@@ -120,7 +122,7 @@ def resolveIO (policy : Policy) (endpoint : LeanKohaku.RPC.Outbound.Endpoint)
       | .error e => pure (.error (-32602, e))
       | .ok node =>
           let resolverData := selectorPlusNode resolverSelector node
-          match ← LeanKohaku.RPC.Outbound.ethCall policy endpoint registry resolverData with
+          match ← LeanKohaku.RPC.Outbound.ethCall policy endpoint registry resolverData "latest" via? with
           | .error e => pure (.error (-32020, s!"resolver lookup failed: {e}"))
           | .ok rJson =>
               match asString rJson with
@@ -133,7 +135,7 @@ def resolveIO (policy : Policy) (endpoint : LeanKohaku.RPC.Outbound.Endpoint)
                         pure (.error (-32028, s!"no resolver set for {name}"))
                       else
                         let addrData := selectorPlusNode addrSelector node
-                        match ← LeanKohaku.RPC.Outbound.ethCall policy endpoint resolverAddr addrData with
+                        match ← LeanKohaku.RPC.Outbound.ethCall policy endpoint resolverAddr addrData "latest" via? with
                         | .error e => pure (.error (-32020, s!"addr() lookup failed: {e}"))
                         | .ok aJson =>
                             match asString aJson with

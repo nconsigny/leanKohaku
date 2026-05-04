@@ -8,5 +8,13 @@
 /c/rustcrypto_helpers/target
 /bridge/node_modules/
 /bridge/clearsign/node_modules/
+/bridge/colibri/node_modules/
+/bridge/llm/node_modules/
 /tui/node_modules/
 /tui/dist/
+
+# Colibri stateless light client runtime cache (written to cwd by C4Client
+# WASM when the daemon spawns the sidecar without an explicit storage dir).
+states_*
+sync_*
+code_*

@@ -1,0 +1,24 @@
+{
+  "name": "leankohaku-colibri-bridge",
+  "version": "0.0.1",
+  "main": "bridge.mjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "type": "module",
+  "private": "true",
+  "bin": {
+    "leankohaku-colibri-bridge": "bridge.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@corpus-core/colibri-stateless": "^1.1.24",
+    "viem": "^2.48.8"
+  }
+}

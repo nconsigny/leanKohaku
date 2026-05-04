@@ -23,6 +23,7 @@ import LeanKohaku.Ethereum.Tx
 
 import LeanKohaku.Privacy.NetworkPolicy
 import LeanKohaku.Privacy.Bridge
+import LeanKohaku.Colibri.Bridge
 import LeanKohaku.Network.Provider
 import LeanKohaku.Network.Endpoint
 

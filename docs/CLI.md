@@ -1,8 +1,22 @@
 # CLI
 
-The CLI is the primary wallet surface. It must not talk directly to
-Ethereum nodes, indexers, analytics, price feeds, fiat/onramp APIs,
-metadata services, crash-report services, or peer-discovery services.
+The CLI is the primary wallet surface and is a **thin JSON-RPC forwarder**
+to the daemon. It must not talk directly to Ethereum nodes, indexers,
+analytics, price feeds, fiat/onramp APIs, metadata services, crash-report
+services, or peer-discovery services. State-bearing operations
+(default-account file, account formatting, preflight policy check) live
+daemon-side; the CLI calls `account.getDefault` / `account.setDefault` /
+`account.list` / `daemon.preflight` and pretty-prints the response.
+Interactive prompts (e.g. the Y/N after `wallet create r1`) intentionally
+remain CLI-side.
+
+For the bundled TUI:
+
+```bash
+kohaku tui
+```
+
+See the [Daemon RPC catalog](./DAEMON.md) for the full method list.
 
 ## Commands
 

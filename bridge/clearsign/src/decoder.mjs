@@ -57,6 +57,42 @@ export function decodeTxIntent(req, registry) {
   }
 
   if (!chosen) {
+    // Last resort: look the selector up in the bundled 4byte dict and
+    // render a "signature-only" decode. No intent, no token metadata, but
+    // the user at least sees what arguments are being passed instead of
+    // raw hex. This is strictly better UX than "unknown contract" for the
+    // long tail of contracts that don't have an ERC-7730 descriptor.
+    const fallbackSig = registry.fallback?.get(selector);
+    if (fallbackSig) {
+      try {
+        const decoded = decodeCalldata(fallbackSig, data);
+        const structured = buildStructuredRoot(fallbackSig, decoded.args);
+        const fields = Object.entries(structured)
+          // Skip the positional index aliases ("0", "1", ...) so we render
+          // each arg once under its named form.
+          .filter(([k]) => /^[A-Za-z_]/.test(k))
+          .map(([k, v]) => ({
+            label: k,
+            formatter: "raw",
+            raw: jsonSafeArg(v),
+            formatted: renderRaw(v),
+          }));
+        return {
+          matched: true,
+          partial: true,
+          source: "4byte.json",
+          contractName: null,
+          owner: null,
+          function: fallbackSig,
+          intent: null,
+          selector,
+          fields,
+          warning: "no ERC-7730 descriptor; arguments decoded by signature only",
+        };
+      } catch (e) {
+        // fall through to the unmatched response
+      }
+    }
     return {
       matched: false,
       reason: depDescriptor
@@ -121,6 +157,35 @@ export function decodeTxIntent(req, registry) {
     selector,
     fields,
   };
+}
+
+// JSON-safe rendering for fallback fields (BigInt, Uint8Array, nested).
+function jsonSafeArg(v) {
+  if (typeof v === "bigint") return "0x" + v.toString(16);
+  if (v instanceof Uint8Array) return "0x" + Buffer.from(v).toString("hex");
+  if (Array.isArray(v)) return v.map(jsonSafeArg);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const [k, val] of Object.entries(v)) out[k] = jsonSafeArg(val);
+    return out;
+  }
+  return v;
+}
+
+function renderRaw(v) {
+  if (v === undefined || v === null) return "(empty)";
+  if (typeof v === "bigint") return v.toString();
+  if (typeof v === "string") return v;
+  if (v instanceof Uint8Array) return "0x" + Buffer.from(v).toString("hex");
+  try {
+    return JSON.stringify(v, (_k, x) => {
+      if (typeof x === "bigint") return "0x" + x.toString(16);
+      if (x instanceof Uint8Array) return "0x" + Buffer.from(x).toString("hex");
+      return x;
+    });
+  } catch {
+    return String(v);
+  }
 }
 
 // Re-parse the format key to extract input names + positions, then expose

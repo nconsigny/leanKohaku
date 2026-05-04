@@ -8,15 +8,38 @@ import RpcRunner from "../widgets/RpcRunner.js";
 import { call } from "../daemon.js";
 import { theme } from "../theme.js";
 import { formatEth, hexToBigInt, shortAddr } from "../format.js";
+import { TransfersBlock } from "../widgets/TransfersBlock.js";
 
 type Props = {
   wallet: Wallet;
+  colibriEnabled?: boolean;
   onDone: (success: boolean) => void;
 };
 
 type Phase =
   | { kind: "form" }
   | { kind: "resolving"; raw: string; amountEth: string; passphrase?: string }
+  | {
+      kind: "unlocking";
+      to: string;
+      amountEth: string;
+      passphrase: string;
+    }
+  | {
+      kind: "simulating";
+      to: string;
+      amountEth: string;
+      passphrase?: string;
+    }
+  | {
+      kind: "confirm";
+      to: string;
+      amountEth: string;
+      passphrase?: string;
+      decoded: any;
+      sim: any;
+      colibri: any;
+    }
   | {
       kind: "run";
       to: string;
@@ -36,7 +59,10 @@ function ethToWei(amountEth: string): bigint {
 
 /** Send ETH from any wallet. EOA → eoa.send (passphrase prompt). TPM/R1 →
  *  r1.sendEthSepolia (biometric prompt streamed via notifications). */
-export default function SendFlow({ wallet, onDone }: Props) {
+export default function SendFlow({ wallet, colibriEnabled, onDone }: Props) {
+  // Default off; can be overridden via app-level toggle (MainMenu) or the
+  // KOHAKU_COLIBRI env seed at startup.
+  const useColibri = colibriEnabled ?? false;
   const [phase, setPhase] = useState<Phase>({ kind: "form" });
 
   if (phase.kind === "form") {
@@ -82,16 +108,24 @@ export default function SendFlow({ wallet, onDone }: Props) {
           onCancel={() => onDone(false)}
           onSubmit={(v) => {
             const raw = (v.to ?? "").trim();
+            const next = (to: string) =>
+              wallet.kind === "eoa"
+                ? ({
+                    kind: "unlocking",
+                    to,
+                    amountEth: v.amountEth ?? "",
+                    passphrase: v.passphrase ?? "",
+                  } as Phase)
+                : ({
+                    kind: "simulating",
+                    to,
+                    amountEth: v.amountEth ?? "",
+                  } as Phase);
             // If the user typed a 0x address, skip ENS resolution. Otherwise
             // resolve before dispatch — the daemon's send paths expect a
             // canonical 20-byte address and reject ENS literals.
             if (ADDR_RE.test(raw)) {
-              setPhase({
-                kind: "run",
-                to: raw,
-                amountEth: v.amountEth ?? "",
-                passphrase: v.passphrase,
-              });
+              setPhase(next(raw));
             } else {
               setPhase({
                 kind: "resolving",
@@ -111,12 +145,20 @@ export default function SendFlow({ wallet, onDone }: Props) {
       <ResolveStep
         raw={phase.raw}
         onResolved={(addr) =>
-          setPhase({
-            kind: "run",
-            to: addr,
-            amountEth: phase.amountEth,
-            passphrase: phase.passphrase,
-          })
+          setPhase(
+            wallet.kind === "eoa"
+              ? {
+                  kind: "unlocking",
+                  to: addr,
+                  amountEth: phase.amountEth,
+                  passphrase: phase.passphrase ?? "",
+                }
+              : {
+                  kind: "simulating",
+                  to: addr,
+                  amountEth: phase.amountEth,
+                },
+          )
         }
         onError={(msg) =>
           setPhase({ kind: "resolveError", raw: phase.raw, message: msg })
@@ -146,20 +188,98 @@ export default function SendFlow({ wallet, onDone }: Props) {
     );
   }
 
-  // Dispatch.
-  if (wallet.kind === "eoa") {
+  // EOA-only: unlock the slot before simulating. R1/TPM skip this step —
+  // biometric is gated by the daemon at signing time.
+  if (phase.kind === "unlocking") {
     return (
-      <EoaSend
+      <UnlockStep
         wallet={wallet}
+        passphrase={phase.passphrase}
+        onUnlocked={() =>
+          setPhase({
+            kind: "simulating",
+            to: phase.to,
+            amountEth: phase.amountEth,
+            passphrase: phase.passphrase,
+          })
+        }
+        onError={(msg) => setPhase({ kind: "unlockError", message: msg })}
+      />
+    );
+  }
+
+  // Pre-sign clear-signing gate. Runs for BOTH EOA and R1/TPM — every
+  // signed tx flows through this gate (ERC-7730 phase 2). For native ETH
+  // transfers calldata is "0x" so the descriptor returns no match (correct);
+  // the simulator still tells us would-revert / gas / transfers.
+  if (phase.kind === "simulating") {
+    return (
+      <SimulateStep
+        from={wallet.address}
         to={phase.to}
         amountEth={phase.amountEth}
-        passphrase={phase.passphrase ?? ""}
-        onUnlockError={(msg) => setPhase({ kind: "unlockError", message: msg })}
+        useColibri={useColibri}
+        onResult={(decoded, sim, colibri) =>
+          setPhase({
+            kind: "confirm",
+            to: phase.to,
+            amountEth: phase.amountEth,
+            passphrase: phase.passphrase,
+            decoded,
+            sim,
+            colibri,
+          })
+        }
+      />
+    );
+  }
+
+  if (phase.kind === "confirm") {
+    return (
+      <ConfirmGate
+        title={`Confirm: send ${phase.amountEth} ETH from ${wallet.name}${
+          wallet.kind === "eoa" ? "" : " (TPM/R1)"
+        }`}
+        subtitle={
+          wallet.kind === "eoa"
+            ? `to ${phase.to}`
+            : `to ${phase.to} · biometric verification will be requested`
+        }
+        decoded={phase.decoded}
+        sim={phase.sim}
+        colibri={phase.colibri}
+        onConfirm={() =>
+          setPhase({
+            kind: "run",
+            to: phase.to,
+            amountEth: phase.amountEth,
+            passphrase: phase.passphrase,
+          })
+        }
+        onCancel={() => onDone(false)}
+      />
+    );
+  }
+
+  // phase.kind === "run" — actually broadcast. The slot is already unlocked
+  // (EOA) or about to prompt the user for biometric (R1/TPM).
+  if (wallet.kind === "eoa") {
+    const wei = ethToWei(phase.amountEth);
+    return (
+      <RpcRunner
+        title={`Sending ${phase.amountEth} ETH from ${wallet.name}`}
+        subtitle={`to ${phase.to}`}
+        method="eoa.send"
+        params={{
+          name: wallet.name,
+          to: phase.to,
+          value: wei,
+        }}
+        renderResult={(r) => <SendResult result={r} />}
         onDone={onDone}
       />
     );
   }
-  // TPM/R1 — biometric is gated by the daemon and surfaced as notifications.
   return (
     <RpcRunner
       title={`Sending ${phase.amountEth} ETH from ${wallet.name} (TPM/R1)`}
@@ -176,138 +296,106 @@ export default function SendFlow({ wallet, onDone }: Props) {
   );
 }
 
-/** Unlock the EOA slot with the form-supplied passphrase, then dispatch
- *  eoa.send. Mirrors the CLI's callWithAutoUnlock behavior, except we have
- *  the passphrase up-front so we unlock unconditionally instead of waiting
- *  for a -32012 retry. */
-type EoaPhase =
-  | { kind: "unlocking" }
-  | { kind: "simulating" }
-  | { kind: "confirm"; decoded: any; sim: any }
-  | { kind: "sending" };
-
-function EoaSend({
+function UnlockStep({
   wallet,
-  to,
-  amountEth,
   passphrase,
-  onUnlockError,
-  onDone,
+  onUnlocked,
+  onError,
 }: {
   wallet: Wallet;
-  to: string;
-  amountEth: string;
   passphrase: string;
-  onUnlockError: (msg: string) => void;
-  onDone: (success: boolean) => void;
+  onUnlocked: () => void;
+  onError: (msg: string) => void;
 }) {
-  const [phase, setPhase] = useState<EoaPhase>({ kind: "unlocking" });
-  const wei = ethToWei(amountEth);
-  const valueHex = "0x" + wei.toString(16);
-
-  // Step 1: unlock the slot. The passphrase came from the form one screen
-  // up; submitting it to `eoa.unlock` rather than passing it into eoa.send
-  // mirrors the CLI's auto-unlock pattern (Cli/Runtime.lean:430-447).
   useEffect(() => {
-    if (phase.kind !== "unlocking") return;
     let cancelled = false;
     call("eoa.unlock", { name: wallet.name, passphrase }).then((r) => {
       if (cancelled) return;
-      if (!r.ok) return onUnlockError(`${r.error.message} (code ${r.error.code})`);
-      setPhase({ kind: "simulating" });
+      if (!r.ok) return onError(`${r.error.message} (code ${r.error.code})`);
+      onUnlocked();
     });
     return () => {
       cancelled = true;
     };
-  }, [phase.kind]);
+  }, []);
+  return (
+    <Layout title={`Unlocking ${wallet.name}…`}>
+      <Text>
+        <Text color={theme.primary}>
+          <Spinner type="dots" />
+        </Text>{" "}
+        <Text color={theme.dim}>verifying passphrase</Text>
+      </Text>
+    </Layout>
+  );
+}
 
-  // Step 2: pre-sign clear-signing gate — decode + simulate before the user
-  // authorizes any signing. For native ETH transfers calldata is "0x" so
-  // the decoder returns no descriptor match (correct), but the simulator
-  // still tells us the receipient exists / would-revert / gas estimate.
-  // Phase 2 ERC-7730: every signed tx flows through this gate.
+// Colibri stateless simulation is opt-in (cold-start can take several
+// seconds for the sync committee bootstrap). When `useColibri` is true,
+// `tx.simulateColibri` runs in parallel with the existing untrusted-RPC
+// path. The Colibri output is a second, consensus-verified witness
+// rendered alongside (not replacing) the existing simulation panel.
+function SimulateStep({
+  from,
+  to,
+  amountEth,
+  useColibri,
+  onResult,
+}: {
+  from: string;
+  to: string;
+  amountEth: string;
+  useColibri: boolean;
+  onResult: (decoded: any, sim: any, colibri: any) => void;
+}) {
   useEffect(() => {
-    if (phase.kind !== "simulating") return;
     let cancelled = false;
+    const wei = ethToWei(amountEth);
+    const valueHex = "0x" + wei.toString(16);
+    const tx = {
+      chainId: 11155111,
+      to,
+      value: valueHex,
+      data: "0x",
+      from,
+    };
     Promise.all([
-      call<any>("tx.decodeIntent", {
-        chainId: 11155111,
-        to,
-        value: valueHex,
-        data: "0x",
-        from: wallet.address,
-      }),
-      call<any>("tx.simulate", {
-        chainId: 11155111,
-        to,
-        value: valueHex,
-        data: "0x",
-        from: wallet.address,
-        block: "latest",
-      }),
-    ]).then(([d, s]) => {
+      call<any>("tx.decodeIntent", tx),
+      call<any>("tx.simulate", { ...tx, block: "latest", trace: true }),
+      useColibri
+        ? call<any>("tx.simulateColibri", { ...tx, block: "latest" })
+        : Promise.resolve({ ok: true, result: null } as any),
+    ]).then(([d, s, c]) => {
       if (cancelled) return;
       const decoded = d.ok ? (d.result?.result ?? d.result) : { matched: false };
       const sim = s.ok ? s.result : { ok: false, simRpcError: s.error.message };
-      setPhase({ kind: "confirm", decoded, sim });
+      // Colibri response is wrapped: { ok: true, result: <SimResult> }
+      // (matches the responseToJson shape from the bridge module).
+      const colibri = !useColibri
+        ? null
+        : c.ok && c.result?.ok
+          ? c.result.result
+          : c.ok
+            ? { error: c.result?.error?.message ?? "colibri unavailable" }
+            : { error: c.error.message };
+      onResult(decoded, sim, colibri);
     });
     return () => {
       cancelled = true;
     };
-  }, [phase.kind]);
-
-  // Step 3: confirm screen. Enter advances to the actual eoa.send;
-  // Esc bails out without signing. This is the load-bearing piece — the
-  // user looks at the simulated effect, not the form they typed.
-  if (phase.kind === "unlocking") {
-    return (
-      <Layout title={`Unlocking ${wallet.name}…`}>
-        <Text>
-          <Text color={theme.primary}>
-            <Spinner type="dots" />
-          </Text>{" "}
-          <Text color={theme.dim}>verifying passphrase</Text>
-        </Text>
-      </Layout>
-    );
-  }
-  if (phase.kind === "simulating") {
-    return (
-      <Layout title="Pre-sign check">
-        <Text>
-          <Text color={theme.primary}>
-            <Spinner type="dots" />
-          </Text>{" "}
-          <Text color={theme.dim}>simulating transaction against the RPC node…</Text>
-        </Text>
-      </Layout>
-    );
-  }
-  if (phase.kind === "confirm") {
-    return (
-      <ConfirmGate
-        title={`Confirm: send ${amountEth} ETH from ${wallet.name}`}
-        subtitle={`to ${to}`}
-        decoded={phase.decoded}
-        sim={phase.sim}
-        onConfirm={() => setPhase({ kind: "sending" })}
-        onCancel={() => onDone(false)}
-      />
-    );
-  }
+  }, []);
   return (
-    <RpcRunner
-      title={`Sending ${amountEth} ETH from ${wallet.name}`}
-      subtitle={`to ${to}`}
-      method="eoa.send"
-      params={{
-        name: wallet.name,
-        to,
-        value: wei,
-      }}
-      renderResult={(r) => <SendResult result={r} />}
-      onDone={onDone}
-    />
+    <Layout title="Pre-sign check">
+      <Text>
+        <Text color={theme.primary}>
+          <Spinner type="dots" />
+        </Text>{" "}
+        <Text color={theme.dim}>
+          simulating transaction against the RPC node
+          {useColibri ? " + Colibri stateless light client" : ""}…
+        </Text>
+      </Text>
+    </Layout>
   );
 }
 
@@ -319,6 +407,7 @@ function ConfirmGate({
   subtitle,
   decoded,
   sim,
+  colibri,
   onConfirm,
   onCancel,
 }: {
@@ -326,6 +415,7 @@ function ConfirmGate({
   subtitle: string;
   decoded: any;
   sim: any;
+  colibri?: any;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -399,7 +489,9 @@ function ConfirmGate({
         {sim?.simRpcError && (
           <Text color={theme.dim}>{sim.simRpcError}</Text>
         )}
+        <TransfersBlock sim={sim} />
       </Box>
+      {colibri && <ColibriBlock colibri={colibri} />}
       {!okSim && !sim?.simRpcError && (
         <Text color={theme.warn}>
           ⚠ Simulation failed. Pressing Enter will still broadcast — only
@@ -407,6 +499,69 @@ function ConfirmGate({
         </Text>
       )}
     </Layout>
+  );
+}
+
+/** Colibri stateless verification panel. Rendered alongside (not in
+ *  place of) the untrusted-RPC simulation block — two independent
+ *  witnesses. status === "0x1" means the EVM run by Colibri's WASM
+ *  succeeded; logs come pre-decoded with ABI from Colibri. */
+function ColibriBlock({ colibri }: { colibri: any }) {
+  if (!colibri) return null;
+  if (colibri.error) {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Text color={theme.dim}>
+          colibri (verified): <Text color={theme.warn}>unavailable</Text>{" "}
+          <Text color={theme.dim}>· {String(colibri.error).slice(0, 120)}</Text>
+        </Text>
+      </Box>
+    );
+  }
+  const ok = colibri.status === "0x1";
+  const gas = (() => {
+    try {
+      return BigInt(colibri.gasUsed ?? "0x0").toString();
+    } catch {
+      return String(colibri.gasUsed ?? "");
+    }
+  })();
+  const logs: any[] = Array.isArray(colibri.logs) ? colibri.logs : [];
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <Text>
+        <Text color={theme.dim}>colibri (verified): </Text>
+        {ok ? (
+          <Text color={theme.ok}>✓ would succeed</Text>
+        ) : (
+          <Text color={theme.err}>✗ would revert</Text>
+        )}
+        <Text color={theme.dim}> · gas {gas}</Text>
+      </Text>
+      {logs.length > 0 && (
+        <Box flexDirection="column" marginLeft={2}>
+          {logs.slice(0, 6).map((log, i) => (
+            <Text key={i}>
+              <Text color={theme.dim}>log {i}: </Text>
+              <Text>{log.name ?? "(unknown)"}</Text>
+              <Text color={theme.dim}>
+                {log.inputs && log.inputs.length > 0
+                  ? "(" +
+                    log.inputs
+                      .map((inp: any) => `${inp.name}=${inp.value}`)
+                      .join(", ")
+                      .slice(0, 100) +
+                    ")"
+                  : ""}
+              </Text>
+            </Text>
+          ))}
+          {logs.length > 6 && (
+            <Text color={theme.dim}>… {logs.length - 6} more logs</Text>
+          )}
+        </Box>
+      )}
+    </Box>
   );
 }
 

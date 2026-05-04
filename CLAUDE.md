@@ -35,6 +35,44 @@ Three-layer structure; dependency flows downward and the `Invariants` tree is wh
 
 `LeanKohaku.lean` is import-only and re-exports every module, so downstream code writes `import LeanKohaku`.
 
+### Sidecars (`bridge/`)
+
+Three untrusted Node sidecars live outside the Lean tree. Each is one-shot stdio JSON-RPC, spawned per call by the daemon. The Lean-side spawn modules are the **only** places that fork them:
+
+| Sidecar | Lean wrapper | Purpose | Trusted for? |
+|---|---|---|---|
+| `bridge/` | `LeanKohaku/Privacy/Bridge.lean` | Privacy Pools / Railgun (snarkjs, libp2p) | Witness generation; **not** tx structure |
+| `bridge/clearsign/` | `LeanKohaku/Clearsign/Bridge.lean` | ERC-7730 calldata + EIP-712 walker | UI rendering only |
+| `bridge/llm/` | `LeanKohaku/LlmAgent/Bridge.lean` | NL → tx-draft candidates (Anthropic SDK + viem) | UI suggestion only |
+
+The trust model is uniform: **every sidecar is treated as malicious**. The daemon never signs based on a sidecar's output. Drafted txs flow through the daemon's `tx.decodeIntent` + `tx.simulate` and a TUI `ConfirmGate` before any `eoa.send` / `r1.send*` happens. Sidecars can read chain state through the daemon (`bridge/llm/src/daemon-callback.mjs` opens UDS back to the daemon's socket) but every read is policy-gated by `Privacy.NetworkPolicy` exactly like CLI/TUI requests.
+
+Adding a new daemon-callback tool in the LLM sidecar: encode calldata via viem, call through `chain.ethCall` (the general policy-gated `eth_call` primitive). No per-protocol daemon RPC needed; see `get_aave_health_factor`, `get_uniswap_v3_quote`, and `get_morpho_blue_position` in `bridge/llm/src/anthropic-agent.mjs` as templates.
+
+### Pre-sign pipeline
+
+Every signing flow (TUI Send, SendRawFlow from the LLM agent, the manual Decode screen) goes through the same gate before reaching `eoa.send`:
+
+```
+  build {to, value, data}
+        ↓
+  tx.decodeIntent  ──→  ERC-7730 descriptor (or 4byte fallback) → human intent
+        ↓
+  tx.simulate      ──→  eth_call + eth_estimateGas + (opt) debug_traceCall
+        ↓                    └→ daemon walks trace, prefetches token meta,
+        ↓                       returns transfers → TransfersBlock renders
+        ↓                       "0.1 USDC" with proper decimals
+  ConfirmGate      ──→  user inspects intent + sim outcome + token movements
+        ↓                    Esc bails; Enter advances
+  eoa.send / r1.send*  ──→  signs and broadcasts
+```
+
+If you're adding a new "produces calldata" surface (a new dApp integration, a new agent tool, a paste-raw flow), wire it through this gate — never call `eoa.send` directly. The `SendRawFlow` component is the canonical reusable confirm path.
+
+### Thin CLI
+
+Per CLAUDE.md the CLI is a JSON-RPC forwarder. Wallet file I/O, account formatting, and preflight all live daemon-side now (`account.getDefault/setDefault`, `account.list`, `daemon.preflight`). Only interactive prompts (e.g. the Y/N after `tpm.create`) intentionally stay CLI-side. When adding a new command, the test is: does it manipulate state? If so, the daemon owns it, the CLI is a printer.
+
 ## Invariants workflow
 
 `INVARIANTS.md` is the living source of truth for properties the wallet must satisfy. Every invariant is tagged 📝 stated → 🚧 in-progress → ✅ proved (or 🔒 axiomatized for FFI boundaries). The workflow when adding a new property:

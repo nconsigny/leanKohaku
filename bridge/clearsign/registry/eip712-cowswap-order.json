@@ -1,0 +1,39 @@
+{
+  "$schema": "../specs/erc7730-v1.schema.json",
+  "context": {
+    "$id": "CowSwapOrder",
+    "eip712": {
+      "domain": {
+        "name": "Gnosis Protocol",
+        "version": "v2"
+      },
+      "deployments": [
+        { "chainId": 1,        "verifyingContract": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41" },
+        { "chainId": 11155111, "verifyingContract": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41" },
+        { "chainId": 100,      "verifyingContract": "0x9008D19f58AAbD9eD0D60971565AA8510560ab41" }
+      ]
+    }
+  },
+  "metadata": {
+    "owner": "CoW Protocol",
+    "contractName": "CoW Swap order",
+    "info": { "url": "https://docs.cow.fi/cow-protocol/reference/core/auctions/orders" }
+  },
+  "display": {
+    "formats": {
+      "Order(address sellToken,address buyToken,address receiver,uint256 sellAmount,uint256 buyAmount,uint32 validTo,bytes32 appData,uint256 feeAmount,string kind,bool partiallyFillable,string sellTokenBalance,string buyTokenBalance)": {
+        "intent": "Sign a CoW Swap order",
+        "fields": [
+          { "path": "sellToken",  "label": "Sell token", "format": "addressName" },
+          { "path": "sellAmount", "label": "Sell amount","format": "tokenAmount", "params": { "tokenPath": "sellToken" } },
+          { "path": "buyToken",   "label": "Buy token",  "format": "addressName" },
+          { "path": "buyAmount",  "label": "Min buy",    "format": "tokenAmount", "params": { "tokenPath": "buyToken" } },
+          { "path": "receiver",   "label": "Receiver",   "format": "addressName" },
+          { "path": "validTo",    "label": "Expires at", "format": "date", "params": { "encoding": "timestamp" } },
+          { "path": "kind",       "label": "Kind",       "format": "raw" },
+          { "path": "feeAmount",  "label": "Fee",        "format": "tokenAmount", "params": { "tokenPath": "sellToken" } }
+        ]
+      }
+    }
+  }
+}

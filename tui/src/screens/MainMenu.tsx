@@ -11,17 +11,20 @@ export type MainAction =
   | "import-wallet"
   | "privacy"
   | "daemon"
+  | "toggle-colibri"
   | "more"
   | "quit";
 
 type Props = {
   onPick: (a: MainAction) => void;
+  colibriEnabled: boolean;
+  colibriPending?: boolean;
 };
 
 /** Top-level entry. The "Wallets" item is the most-used path; everything
  *  else is workflow-organized rather than namespace-organized so users
  *  don't need to know the CLI verb tree. */
-export default function MainMenu({ onPick }: Props) {
+export default function MainMenu({ onPick, colibriEnabled, colibriPending }: Props) {
   useInput((input) => {
     if (input === "q") onPick("quit");
   });
@@ -32,6 +35,16 @@ export default function MainMenu({ onPick }: Props) {
     { label: "Import wallet",                                 value: "import-wallet" },
     { label: "Privacy Pools (balance / mnemonic / unshield)", value: "privacy" },
     { label: "Daemon status",                                 value: "daemon" },
+    {
+      label: `Colibri stateless simulation: ${
+        colibriPending
+          ? "…"
+          : colibriEnabled
+            ? "ON  ✓ (verified, persistent)"
+            : "off"
+      }`,
+      value: "toggle-colibri",
+    },
     { label: "More commands (advanced)",                      value: "more" },
     { label: "Quit",                                          value: "quit" },
   ];

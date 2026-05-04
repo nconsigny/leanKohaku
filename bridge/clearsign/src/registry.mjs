@@ -45,6 +45,11 @@ export function loadRegistry() {
   const byDeployment = new Map();
   // selector → array of { descriptor, formatKey, formatSpec }
   const bySelector = new Map();
+  // (chainId:verifyingContract) → eip712 descriptor (same shape; routes through
+  // the descriptor's `context.eip712` block instead of `context.contract`).
+  const byEip712 = new Map();
+  // selector → signature  (4byte fallback, last resort)
+  const fallback = new Map();
 
   for (const file of files) {
     let descriptor;
@@ -56,6 +61,21 @@ export function loadRegistry() {
     }
     descriptor.__source = path.basename(file);
 
+    // Special-case the 4byte fallback dict — it doesn't follow the 7730
+    // schema, just maps `selector → signature` grouped under arbitrary
+    // category keys for readability.
+    if (path.basename(file) === "4byte.json") {
+      for (const [_category, entries] of Object.entries(descriptor)) {
+        if (typeof entries !== "object" || entries === null) continue;
+        for (const [sel, sig] of Object.entries(entries)) {
+          if (/^0x[0-9a-fA-F]{8}$/.test(sel) && typeof sig === "string") {
+            fallback.set(sel.toLowerCase(), sig);
+          }
+        }
+      }
+      continue;
+    }
+
     const deployments = descriptor?.context?.contract?.deployments ?? [];
     for (const d of deployments) {
       if (typeof d?.chainId === "number" && typeof d?.address === "string") {
@@ -64,8 +84,23 @@ export function loadRegistry() {
       }
     }
 
+    // EIP-712 descriptors bind via context.eip712.deployments (chainId +
+    // verifyingContract) instead of context.contract.deployments.
+    const eip712Deployments = descriptor?.context?.eip712?.deployments ?? [];
+    for (const d of eip712Deployments) {
+      if (typeof d?.chainId === "number" && typeof d?.verifyingContract === "string") {
+        const key = `${d.chainId}:${d.verifyingContract.toLowerCase()}`;
+        byEip712.set(key, descriptor);
+      }
+    }
+
     const formats = descriptor?.display?.formats ?? {};
     for (const [formatKey, formatSpec] of Object.entries(formats)) {
+      // EIP-712 format keys use the encodeType string ("Mail(Person from,...)"),
+      // which we never want to hash as a function selector. Detect: if the key
+      // doesn't look like a function ABI fragment ("name(args)"), skip the
+      // selector index — this format is for EIP-712 messages.
+      if (!/^[A-Za-z_][A-Za-z0-9_]*\(/.test(formatKey)) continue;
       let sel;
       try {
         sel = formatKeyToSelector(formatKey);
@@ -78,5 +113,5 @@ export function loadRegistry() {
     }
   }
 
-  return { byDeployment, bySelector };
+  return { byDeployment, bySelector, byEip712, fallback };
 }

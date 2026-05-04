@@ -1,0 +1,48 @@
+{
+  "_comment": "Last-resort fallback for selectors not covered by an ERC-7730 descriptor. Wallet renders these as 'signature-only' — argument types and labels are correct but there's no human-readable intent or token metadata. Keep entries small and well-known; this is not a full 4byte mirror.",
+
+  "ERC-721 + ERC-1155": {
+    "0x42842e0e": "safeTransferFrom(address from,address to,uint256 tokenId)",
+    "0xb88d4fde": "safeTransferFrom(address from,address to,uint256 tokenId,bytes data)",
+    "0xa22cb465": "setApprovalForAll(address operator,bool approved)",
+    "0xf242432a": "safeTransferFrom(address from,address to,uint256 id,uint256 amount,bytes data)",
+    "0x2eb2c2d6": "safeBatchTransferFrom(address from,address to,uint256[] ids,uint256[] amounts,bytes data)"
+  },
+
+  "WETH9": {
+    "0xd0e30db0": "deposit()",
+    "0x2e1a7d4d": "withdraw(uint256 wad)"
+  },
+
+  "Aave V3 Pool": {
+    "0x617ba037": "supply(address asset,uint256 amount,address onBehalfOf,uint16 referralCode)",
+    "0x69328dec": "withdraw(address asset,uint256 amount,address to)",
+    "0xa415bcad": "borrow(address asset,uint256 amount,uint256 interestRateMode,uint16 referralCode,address onBehalfOf)",
+    "0x573ade81": "repay(address asset,uint256 amount,uint256 interestRateMode,address onBehalfOf)"
+  },
+
+  "Compound v3": {
+    "0xf2b9fdb8": "supply(address asset,uint256 amount)",
+    "0xf3fef3a3": "withdraw(address asset,uint256 amount)"
+  },
+
+  "Uniswap V2 Router": {
+    "0x38ed1739": "swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,address[] path,address to,uint256 deadline)",
+    "0x7ff36ab5": "swapExactETHForTokens(uint256 amountOutMin,address[] path,address to,uint256 deadline)",
+    "0x18cbafe5": "swapExactTokensForETH(uint256 amountIn,uint256 amountOutMin,address[] path,address to,uint256 deadline)"
+  },
+
+  "Multicall3": {
+    "0x252dba42": "aggregate((address,bytes)[] calls)",
+    "0xbce38bd7": "tryAggregate(bool requireSuccess,(address,bytes)[] calls)"
+  },
+
+  "ENS": {
+    "0xf7a16963": "registerWithConfig(string name,address owner,uint256 duration,bytes32 secret,address resolver,address addr)",
+    "0xc1a287e2": "renew(string name,uint256 duration)"
+  },
+
+  "Common ETH operations": {
+    "0xfb3bdb41": "swapETHForExactTokens(uint256 amountOut,address[] path,address to,uint256 deadline)"
+  }
+}

@@ -5,6 +5,7 @@ import { Layout, Banner } from "../widgets/Layout.js";
 import Form, { Field } from "../widgets/Form.js";
 import { call } from "../daemon.js";
 import { theme } from "../theme.js";
+import { TransfersBlock } from "../widgets/TransfersBlock.js";
 
 type Props = { onDone: (s: boolean) => void };
 
@@ -133,6 +134,7 @@ function Runner({
       value: phase.value,
       data: phase.data,
       block: "latest",
+      trace: true,
     };
     if (phase.from) simReq.from = phase.from;
 
@@ -284,6 +286,7 @@ function SimulationView({ sim }: { sim: any }) {
           <Text color={theme.dim}>{String(sim.revertReason)}</Text>
         </Box>
       )}
+      <TransfersBlock sim={sim} />
     </Box>
   );
 }

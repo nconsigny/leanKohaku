@@ -43,6 +43,26 @@ defaults, fallbacks, or convenience features:
 
 - Denies every request.
 
+## Sidecar trust model
+
+The daemon spawns three Node sidecars (`bridge/`, `bridge/clearsign/`,
+`bridge/llm/`) for work that needs heavy JS dependencies (snarkjs, viem,
+Anthropic SDK). Every sidecar is treated as **untrusted**:
+
+- Sidecars never sign. Outputs are JSON, re-validated and re-decoded
+  Lean-side before any signing path is reached.
+- The LLM agent's drafted txs flow through the same `tx.decodeIntent` +
+  `tx.simulate` + TUI `ConfirmGate` as pasted calldata — no fast path.
+- Sidecar chain reads (`bridge/llm/src/daemon-callback.mjs`) loop back
+  through the daemon's policy-gated `chain.*` RPCs, so they obey the same
+  `strict` / `tor` / `deny` boundaries as CLI requests. Sidecars cannot
+  reach the network independently.
+
+An adversarial model output, prompt injection, or compromised sidecar can
+at worst produce confusing simulations the user rejects in the
+`ConfirmGate`. There is no path from a sidecar to a signed transaction that
+bypasses user confirmation.
+
 ## Invariant Modules
 
 - `LeanKohaku.Invariants.Network`

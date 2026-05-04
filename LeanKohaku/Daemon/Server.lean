@@ -6,7 +6,11 @@ import LeanKohaku.Daemon.Uds
 import LeanKohaku.Privacy.NetworkPolicy
 import LeanKohaku.Privacy.Bridge
 import LeanKohaku.Clearsign.Bridge
+import LeanKohaku.Colibri.Bridge
+import LeanKohaku.Colibri.Persistent
 import LeanKohaku.Daemon.TokenMeta
+import LeanKohaku.LlmAgent.Bridge
+import LeanKohaku.Cli.Commands
 import LeanKohaku.RPC.Outbound
 import LeanKohaku.RPC.Server
 import LeanKohaku.Ethereum.Address
@@ -178,6 +182,74 @@ def endpointForChain (cfg : Config) : Option String →
 -- Why: no `defaultConfig` with a URL substitute. The daemon must refuse to
 -- start without a user-configured `rpc_url` (env or daemon.json); see
 -- `LeanKohaku.Daemon.Config.resolve`. Avoids any silent loopback dial.
+
+/-- Build the verified-read backend if the persistent Colibri client is
+    running. Returns `none` when colibri is off so calls fall through to
+    the configured HTTP endpoint. Read sites in this server pass the
+    result to `Outbound.*` to opt every proofable read into stateless
+    verification with one call per use site. -/
+private def colibriVia (state : LeanKohaku.Daemon.State.Shared) (chainId : Nat) :
+    IO (Option LeanKohaku.RPC.Outbound.VerifyVia) := do
+  pure ((← state.get).colibri.map (fun c => (c, chainId)))
+
+/-- Resolve an RPC endpoint from a request. Honors an explicit `chain`
+    string in `params` first; falls back to a tiny chainId → name map for
+    the common cases (1 → "mainnet", 11155111 → "sepolia") so callers that
+    only know the chainId still hit the right per-chain endpoint when the
+    daemon was configured with one. Falls back to `cfg.rpcEndpoint`
+    silently for anything else (clearsign decimals prefetch is best-
+    effort; sidecar gracefully renders raw addresses on miss). -/
+def chainEndpointFor (cfg : Config) (params : Json) (chainId : Nat) :
+    LeanKohaku.RPC.Outbound.Endpoint :=
+  let chainName : Option String :=
+    match getField "chain" params >>= asString with
+    | some s => some s
+    | none =>
+        if chainId = 1 then some "mainnet"
+        else if chainId = 11155111 then some "sepolia"
+        else none
+  match endpointForChain cfg chainName with
+  | .ok ep => ep
+  | .error _ => cfg.rpcEndpoint
+
+/-- ERC-20 `Transfer(address,address,uint256)` event signature. -/
+private def transferEventTopic : String :=
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+/-- Walk a callTracer+withLog trace tree and pull every token address that
+    appears as the emitter of a `Transfer` log. Used to prefetch ERC-20
+    metadata so the TUI can render "100 USDC" instead of raw uint256.
+    `partial` because the callTracer tree is recursive without a bounded
+    measure; in practice depth is small. -/
+private partial def collectTransferTokens : Json → Array String
+  | .obj fields =>
+      let lookup (k : String) :=
+        (fields.find? (fun (key, _) => key = k)).map Prod.snd
+      let fromLogs : Array String :=
+        match lookup "logs" with
+        | some (.arr logArr) =>
+            logArr.filterMap fun log =>
+              match log with
+              | .obj lf =>
+                  let ll (k : String) : Option Json :=
+                    (lf.find? (fun (key, _) => key = k)).map Prod.snd
+                  let isTransfer : Bool :=
+                    match ll "topics" with
+                    | some (Json.arr topics) =>
+                        match (topics[0]? : Option Json) with
+                        | some (Json.str s) => s.toLower = transferEventTopic
+                        | _ => false
+                    | _ => false
+                  if isTransfer then ll "address" >>= asString else (none : Option String)
+              | _ => none
+        | _ => #[]
+      let fromCalls : Array String :=
+        match lookup "calls" with
+        | some (.arr children) =>
+            children.foldl (fun acc c => acc ++ collectTransferTokens c) #[]
+        | _ => #[]
+      fromLogs ++ fromCalls
+  | _ => #[]
 
 private def slotMetadataJson (state : LeanKohaku.Daemon.State.Shared)
     (record : LeanKohaku.Wallet.EoaStore.Record) : IO Json := do
@@ -705,13 +777,14 @@ private def broadcastTimeoutSecs' : IO Nat := do
     be reused by `broadcastAndAwait` without re-shuffling the file. -/
 private partial def waitForReceiptShared
     (cfg : Config) (notify : LeanKohaku.Keystore.Tpm2Runtime.Notifier)
-    (txHash : String) (deadlineMs startMs : Nat) :
+    (txHash : String) (deadlineMs startMs : Nat)
+    (via? : Option LeanKohaku.RPC.Outbound.VerifyVia := none) :
     IO (Except String Json) := do
   let now ← IO.monoMsNow
   if now ≥ deadlineMs then
     pure (.error s!"timed out waiting for receipt after {(now - startMs) / 1000}s")
   else
-    match ← LeanKohaku.RPC.Outbound.getTransactionReceipt cfg.policy cfg.rpcEndpoint txHash with
+    match ← LeanKohaku.RPC.Outbound.getTransactionReceipt cfg.policy cfg.rpcEndpoint txHash via? with
     | .error err => pure (.error err)
     | .ok json =>
         match json with
@@ -721,7 +794,7 @@ private partial def waitForReceiptShared
               ("elapsedSec", .num (Int.ofNat ((now - startMs) / 1000)))
             ])
             IO.sleep 5000
-            waitForReceiptShared cfg notify txHash deadlineMs startMs
+            waitForReceiptShared cfg notify txHash deadlineMs startMs via?
         | _ => pure (.ok json)
 
 /-- Broadcast a signed raw EIP-1559 tx and await its receipt, streaming
@@ -741,7 +814,8 @@ private partial def waitForReceiptShared
     (e.g. `raw`, `signature`, `nonce`, ...). -/
 private def broadcastAndAwait
     (cfg : Config) (notify : LeanKohaku.Keystore.Tpm2Runtime.Notifier)
-    (rawTxHex from_ to : String) (valueWei : Nat) :
+    (rawTxHex from_ to : String) (valueWei : Nat)
+    (via? : Option LeanKohaku.RPC.Outbound.VerifyVia := none) :
     IO (Except RpcError Json) := do
   match ← LeanKohaku.RPC.Outbound.sendRawTransaction cfg.policy cfg.rpcEndpoint rawTxHex with
   | .error err =>
@@ -758,7 +832,7 @@ private def broadcastAndAwait
           let timeoutSecs ← broadcastTimeoutSecs'
           let startMs ← IO.monoMsNow
           let deadlineMs := startMs + timeoutSecs * 1000
-          match ← waitForReceiptShared cfg notify txHash deadlineMs startMs with
+          match ← waitForReceiptShared cfg notify txHash deadlineMs startMs via? with
           | .error err =>
               notify "tx-timeout" (.obj #[
                 ("txHash", .str txHash),
@@ -808,22 +882,23 @@ private def buildSignBroadcastTx
     (cfg : Config) (slot : LeanKohaku.Daemon.State.UnlockedSlot)
     (privateKey : ByteArray) (to : String) (toAddress : LeanKohaku.Ethereum.Address.Address)
     (value : Nat) (data : ByteArray) (nonceOverride? : Option Nat)
-    (notify? : Option LeanKohaku.Keystore.Tpm2Runtime.Notifier := none) :
+    (notify? : Option LeanKohaku.Keystore.Tpm2Runtime.Notifier := none)
+    (via? : Option LeanKohaku.RPC.Outbound.VerifyVia := none) :
     IO (Except RpcError Json) := do
   try
     let nonce ←
       match nonceOverride? with
       | some n => pure n
       | none =>
-          let nonceJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.getTransactionCount cfg.policy cfg.rpcEndpoint slot.address "pending")
+          let nonceJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.getTransactionCount cfg.policy cfg.rpcEndpoint slot.address "pending" via?)
           jsonHexNatIO nonceJson "nonce"
-    let priorityJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.maxPriorityFeePerGas cfg.policy cfg.rpcEndpoint)
-    let gasPriceJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.gasPrice cfg.policy cfg.rpcEndpoint)
+    let priorityJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.maxPriorityFeePerGas cfg.policy cfg.rpcEndpoint via?)
+    let gasPriceJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.gasPrice cfg.policy cfg.rpcEndpoint via?)
     let maxPriorityFeePerGas ← jsonHexNatIO priorityJson "maxPriorityFeePerGas"
     let gasPrice ← jsonHexNatIO gasPriceJson "gasPrice"
     let maxFeePerGas := gasPrice + maxPriorityFeePerGas
     let estimateRequest := estimateTxJson slot.address to value data
-    let gasJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.estimateGas cfg.policy cfg.rpcEndpoint estimateRequest "latest")
+    let gasJson ← expectExcept <| (← LeanKohaku.RPC.Outbound.estimateGas cfg.policy cfg.rpcEndpoint estimateRequest "latest" via?)
     let gasLimit ← jsonHexNatIO gasJson "gasLimit"
     let tx : LeanKohaku.Ethereum.Tx.TxEip1559 := {
       chainId := cfg.chainId,
@@ -856,7 +931,7 @@ private def buildSignBroadcastTx
                     pure <| .error { code := -32020, message := "chain RPC failed", data := some (.str "eth_sendRawTransaction returned non-string result") }
         | some notify =>
             -- Notifier-aware path: broadcast, stream notifications, await receipt.
-            match ← broadcastAndAwait cfg notify raw slot.address to value with
+            match ← broadcastAndAwait cfg notify raw slot.address to value via? with
             | .error err => pure (.error err)
             | .ok extras =>
                 let txHash := (getField "txHash" extras >>= asString).getD ""
@@ -913,9 +988,10 @@ private def parseBridgeTx (json : Json) :
 private def signAndBroadcastBridgeTxns
     (cfg : Config) (slot : LeanKohaku.Daemon.State.UnlockedSlot)
     (privateKey : ByteArray) (txns : Array Json)
-    (notify? : Option LeanKohaku.Keystore.Tpm2Runtime.Notifier := none) :
+    (notify? : Option LeanKohaku.Keystore.Tpm2Runtime.Notifier := none)
+    (via? : Option LeanKohaku.RPC.Outbound.VerifyVia := none) :
     IO (Except RpcError (Array Json)) := do
-  let baseNonceJson ← LeanKohaku.RPC.Outbound.getTransactionCount cfg.policy cfg.rpcEndpoint slot.address "pending"
+  let baseNonceJson ← LeanKohaku.RPC.Outbound.getTransactionCount cfg.policy cfg.rpcEndpoint slot.address "pending" via?
   match baseNonceJson with
   | .error err =>
       pure <| .error { code := -32020, message := "chain RPC failed", data := some (.str err) }
@@ -929,7 +1005,7 @@ private def signAndBroadcastBridgeTxns
             match parseBridgeTx raw with
             | .error err => return .error err
             | .ok (toStr, toAddr, value, data) =>
-                match ← buildSignBroadcastTx cfg slot privateKey toStr toAddr value data (some (baseNonce + idx)) notify? with
+                match ← buildSignBroadcastTx cfg slot privateKey toStr toAddr value data (some (baseNonce + idx)) notify? via? with
                 | .error err => return .error err
                 | .ok j =>
                     -- Why: best-effort shielded.deposit journal entry per broadcast tx.
@@ -975,13 +1051,14 @@ private def extractTxHash (stdout : String) : Option String := do
     a string error on timeout / RPC failure. -/
 private partial def waitForReceipt
     (cfg : Config) (notify : LeanKohaku.Keystore.Tpm2Runtime.Notifier)
-    (txHash : String) (deadlineMs startMs : Nat) :
+    (txHash : String) (deadlineMs startMs : Nat)
+    (via? : Option LeanKohaku.RPC.Outbound.VerifyVia := none) :
     IO (Except String Json) := do
   let now ← IO.monoMsNow
   if now ≥ deadlineMs then
     pure (.error s!"timed out waiting for receipt after {(now - startMs) / 1000}s")
   else
-    match ← LeanKohaku.RPC.Outbound.getTransactionReceipt cfg.policy cfg.rpcEndpoint txHash with
+    match ← LeanKohaku.RPC.Outbound.getTransactionReceipt cfg.policy cfg.rpcEndpoint txHash via? with
     | .error err => pure (.error err)
     | .ok json =>
         match json with
@@ -991,7 +1068,7 @@ private partial def waitForReceipt
               ("elapsedSec", .num (Int.ofNat ((now - startMs) / 1000)))
             ])
             IO.sleep 5000
-            waitForReceipt cfg notify txHash deadlineMs startMs
+            waitForReceipt cfg notify txHash deadlineMs startMs via?
         | _ => pure (.ok json)
 
 /-- End-to-end R1 send flow:
@@ -1003,7 +1080,8 @@ private partial def waitForReceipt
     The script-side calls are still captured via `IO.Process.output`,
     but biometric prompts are now in-process Lean and reach the CLI in
     real time over the existing UDS notification channel. -/
-private def r1SendFlow (cfg : Config) (notify : LeanKohaku.Keystore.Tpm2Runtime.Notifier)
+private def r1SendFlow (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
+    (notify : LeanKohaku.Keystore.Tpm2Runtime.Notifier)
     (keyName to : String) (amount : String) (mode : String) :
     IO (Except RpcError Json) := do
   let scriptEnv : Array (String × Option String) := #[("LEAN_KOHAKU_TPM_KEY", some keyName)]
@@ -1055,7 +1133,8 @@ private def r1SendFlow (cfg : Config) (notify : LeanKohaku.Keystore.Tpm2Runtime.
               let timeoutSecs ← broadcastTimeoutSecs
               let startMs ← IO.monoMsNow
               let deadlineMs := startMs + timeoutSecs * 1000
-              match ← waitForReceipt cfg notify txHash deadlineMs startMs with
+              let via? ← colibriVia state cfg.chainId
+              match ← waitForReceipt cfg notify txHash deadlineMs startMs via? with
               | .error err =>
                   let weiN := wei.toNat?.getD 0
                   journalRecord keyName account to txHash "" "r1.send"
@@ -1171,6 +1250,42 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
       if ← path.pathExists then
         try IO.FS.removeFile path catch _ => pure ()
       pure <| .ok <| .obj #[("ok", .bool true)]
+  | "daemon.preflight" =>
+      -- Why: pushes the CLI's "preflight" dry-run check into the daemon so
+      -- the CLI is a thin printer per CLAUDE.md. Accepts an action JSON
+      -- shape `{ method: "balance"|"send", address?, to?, amountWei? }`,
+      -- runs the same `strictCliPreflight` the CLI used, returns a
+      -- pre-formatted summary + plan. The CLI just echoes the strings.
+      let methodStr := paramStringD req.params "method" ""
+      let action? : Option LeanKohaku.Cli.Commands.Action :=
+        match methodStr with
+        | "balance" =>
+            (getField "address" req.params >>= asString)
+              >>= LeanKohaku.Cli.Commands.parseBalance
+        | "send" =>
+            match (getField "to" req.params >>= asString),
+                  (getField "amountWei" req.params >>= asNat) with
+            | some to, some n => some (.send to n)
+            | _, _ => none
+        | _ => none
+      match action? with
+      | none =>
+          pure <| .ok <| .obj #[
+            ("ok",      .bool false),
+            ("summary", .str s!"preflight denied: invalid {methodStr} action"),
+            ("plan",    .str "")
+          ]
+      | some action =>
+          let req' : LeanKohaku.Cli.Commands.DaemonRequest := { action }
+          let plan := LeanKohaku.Cli.Commands.strictPlan req'
+          let okBool := LeanKohaku.Cli.Commands.strictCliPreflight action
+          pure <| .ok <| .obj #[
+            ("ok", .bool okBool),
+            ("summary",
+              .str (if okBool then s!"preflight OK: {LeanKohaku.Cli.Commands.actionSummary action}"
+                    else s!"preflight denied: {LeanKohaku.Cli.Commands.actionSummary action}")),
+            ("plan", .str (LeanKohaku.Cli.Commands.planSummary plan))
+          ]
   | "tpm.create" =>
       match paramName req.params with
       | .error err => pure (.error err)
@@ -1240,7 +1355,7 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
       | .ok keyName =>
           match paramString req.params "to", paramString req.params "amountWei" with
           | .ok to, .ok amountWei =>
-              r1SendFlow cfg notify keyName to amountWei "wei"
+              r1SendFlow cfg state notify keyName to amountWei "wei"
           | _, _ => pure (.error invalidParams)
   | "r1.sendEthSepolia" =>
       match paramName req.params with
@@ -1248,7 +1363,7 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
       | .ok keyName =>
           match paramString req.params "to", paramString req.params "amountEth" with
           | .ok to, .ok amountEth =>
-              r1SendFlow cfg notify keyName to amountEth "eth"
+              r1SendFlow cfg state notify keyName to amountEth "eth"
           | _, _ => pure (.error invalidParams)
   | "chain.balance" =>
       match paramString req.params "address" with
@@ -1258,7 +1373,8 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
           | none => pure (.error invalidParams)
           | some _ =>
               let block := paramStringD req.params "block" "latest"
-              match ← LeanKohaku.RPC.Outbound.getBalance cfg.policy cfg.rpcEndpoint address block with
+              let via? ← colibriVia state cfg.chainId
+              match ← LeanKohaku.RPC.Outbound.getBalance cfg.policy cfg.rpcEndpoint address block via? with
               | .ok balance =>
                   pure <| .ok <| .obj #[
                     ("address", .str address),
@@ -1275,7 +1391,8 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
           | none => pure (.error invalidParams)
           | some _ =>
               let block := paramStringD req.params "block" "pending"
-              match ← LeanKohaku.RPC.Outbound.getTransactionCount cfg.policy cfg.rpcEndpoint address block with
+              let via? ← colibriVia state cfg.chainId
+              match ← LeanKohaku.RPC.Outbound.getTransactionCount cfg.policy cfg.rpcEndpoint address block via? with
               | .ok nonce =>
                   pure <| .ok <| .obj #[
                     ("address", .str address),
@@ -1285,13 +1402,15 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
               | .error err =>
                   pure <| .error { code := -32020, message := "chain RPC failed", data := some (.str err) }
   | "chain.gasPrice" =>
-      match ← LeanKohaku.RPC.Outbound.gasPrice cfg.policy cfg.rpcEndpoint with
+      let via? ← colibriVia state cfg.chainId
+      match ← LeanKohaku.RPC.Outbound.gasPrice cfg.policy cfg.rpcEndpoint via? with
       | .ok gasPrice =>
           pure <| .ok <| .obj #[("gasPrice", gasPrice)]
       | .error err =>
           pure <| .error { code := -32020, message := "chain RPC failed", data := some (.str err) }
   | "chain.maxPriorityFeePerGas" =>
-      match ← LeanKohaku.RPC.Outbound.maxPriorityFeePerGas cfg.policy cfg.rpcEndpoint with
+      let via? ← colibriVia state cfg.chainId
+      match ← LeanKohaku.RPC.Outbound.maxPriorityFeePerGas cfg.policy cfg.rpcEndpoint via? with
       | .ok maxPriorityFeePerGas =>
           pure <| .ok <| .obj #[("maxPriorityFeePerGas", maxPriorityFeePerGas)]
       | .error err =>
@@ -1301,7 +1420,8 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
       | .error err => pure (.error err)
       | .ok tx =>
           let block := paramStringD req.params "block" "latest"
-          match ← LeanKohaku.RPC.Outbound.estimateGas cfg.policy cfg.rpcEndpoint tx block with
+          let via? ← colibriVia state cfg.chainId
+          match ← LeanKohaku.RPC.Outbound.estimateGas cfg.policy cfg.rpcEndpoint tx block via? with
           | .ok gas =>
               pure <| .ok <| .obj #[
                 ("tx", tx),
@@ -1310,6 +1430,38 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
               ]
           | .error err =>
               pure <| .error { code := -32020, message := "chain RPC failed", data := some (.str err) }
+  | "chain.ethCall" =>
+      -- Why: a general policy-gated `eth_call` for any contract method.
+      -- Used by the LLM agent's tool layer (Aave health factor, future
+      -- Uniswap V3 Quoter, etc.) to read contract state without each
+      -- protocol getting its own daemon RPC. The daemon does no decoding
+      -- of the return value — that's the caller's responsibility, since
+      -- this is a general-purpose primitive.
+      match paramString req.params "to", paramString req.params "data" with
+      | .ok to, .ok data =>
+          match LeanKohaku.Ethereum.Address.fromHex to with
+          | none => pure (.error invalidParams)
+          | some _ =>
+              let block := paramStringD req.params "block" "latest"
+              let chain? := getField "chain" req.params >>= asString
+              match endpointForChain cfg chain? with
+              | .error err =>
+                  pure <| .error { code := -32021, message := "unknown chain", data := some (.str err) }
+              | .ok ep =>
+                  let chainIdParam :=
+                    ((getField "chainId" req.params) >>= asNat).getD cfg.chainId
+                  let via? ← colibriVia state chainIdParam
+                  match ← LeanKohaku.RPC.Outbound.ethCall cfg.policy ep to data block via? with
+                  | .ok ret =>
+                      pure <| .ok <| .obj #[
+                        ("to", .str to),
+                        ("data", .str data),
+                        ("block", .str block),
+                        ("returnData", ret)
+                      ]
+                  | .error err =>
+                      pure <| .error { code := -32020, message := "chain RPC failed", data := some (.str err) }
+      | _, _ => pure (.error invalidParams)
   | "chain.tokenBalance" =>
       match paramString req.params "token", paramString req.params "owner" with
       | .ok token, .ok owner =>
@@ -1317,7 +1469,8 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
           | some _, some ownerAddr =>
               let block := paramStringD req.params "block" "latest"
               let data := erc20BalanceOfData ownerAddr
-              match ← LeanKohaku.RPC.Outbound.ethCall cfg.policy cfg.rpcEndpoint token data block with
+              let via? ← colibriVia state cfg.chainId
+              match ← LeanKohaku.RPC.Outbound.ethCall cfg.policy cfg.rpcEndpoint token data block via? with
               | .ok balance =>
                   pure <| .ok <| .obj #[
                     ("token", .str token),
@@ -1362,7 +1515,9 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
                   "no ENS RPC configured: set LEANKOHAKU_ENS_RPC_URL or 'ens_rpc_url' in daemon.json (mainnet RPC required for ENS resolution)",
                 data := none }
           | some ensEndpoint =>
-              match ← LeanKohaku.Ethereum.Ens.resolveIO cfg.policy ensEndpoint 1 name with
+              -- ENS is mainnet (chainId 1), independent of cfg.chainId.
+              let viaEns? ← colibriVia state 1
+              match ← LeanKohaku.Ethereum.Ens.resolveIO cfg.policy ensEndpoint 1 name viaEns? with
               | .ok r =>
                   pure <| .ok <| .obj #[
                     ("name", .str r.name),
@@ -1381,6 +1536,41 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
           | .error _ => pure acc)
         #[]
       pure (.ok (.arr records))
+  | "account.list" =>
+      -- Why: unified replacement for the CLI's three combined-list helpers
+      -- (`printAccountListNames`, `printAccountListTypedNames`,
+      -- `printAccountListIndices`). Each returns a different projection of
+      -- the same data; consolidating to one daemon RPC removes ~80 LoC of
+      -- near-duplicate CLI code.
+      let eoaNames ← LeanKohaku.Wallet.EoaStore.list
+      let mut entries : Array Json := #[]
+      for name in eoaNames do
+        match ← LeanKohaku.Wallet.EoaStore.load name with
+        | .ok record =>
+            let indices : Array Json :=
+              (recordAccounts record).map (fun a => .num (Int.ofNat a.index))
+            entries := entries.push <| .obj #[
+              ("type",    .str "eoa"),
+              ("name",    .str record.name),
+              ("address", .str record.address),
+              ("indices", .arr indices)
+            ]
+        | .error _ => pure ()
+      let tpmNames ← listSepoliaKeys
+      let stateDir : System.FilePath := ".leankohaku/keystore/tpm2"
+      for name in tpmNames do
+        let addrFile := stateDir / name / "r1-account-address.txt"
+        let address ←
+          if ← addrFile.pathExists then
+            let raw ← IO.FS.readFile addrFile
+            pure raw.trimAscii.toString
+          else pure ""
+        entries := entries.push <| .obj #[
+          ("type",    .str "tpm"),
+          ("name",    .str name),
+          ("address", .str address)
+        ]
+      pure (.ok (.obj #[("accounts", .arr entries)]))
   | "eoa.show" =>
       match paramName req.params with
       | .error err => pure (.error err)
@@ -1625,7 +1815,8 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
                           | .ok privateKey =>
                               -- Why: re-target slot at the resolved account so nonce/from come from the right address.
                               let slot' := { slot with address := fromAddr, derivationPath := path }
-                              let r ← buildSignBroadcastTx cfg slot' privateKey to toAddress value data none (some notify)
+                              let via? ← colibriVia state cfg.chainId
+                              let r ← buildSignBroadcastTx cfg slot' privateKey to toAddress value data none (some notify) via?
                               -- Why: best-effort journal write; never fails the tx.
                               match r with
                               | .ok j =>
@@ -1752,6 +1943,21 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
       let resp ← LeanKohaku.Clearsign.Bridge.call
         { method := "ping", params := .obj #[], id := 0 }
       pure <| .ok <| LeanKohaku.Clearsign.Bridge.responseToJson resp
+  | "llm.ping" =>
+      let resp ← LeanKohaku.LlmAgent.Bridge.call
+        { method := "ping", params := .obj #[], id := 0 }
+      pure <| .ok <| LeanKohaku.LlmAgent.Bridge.responseToJson resp
+  | "tx.draftFromIntent" =>
+      -- Why: the LLM sidecar emits transaction-draft candidates from a
+      -- natural-language prompt. The candidates are NOT signed here — the
+      -- TUI surfaces each one through the existing decode + simulate +
+      -- user-confirm gate (SendFlow's ConfirmGate). This handler is
+      -- effectively a transparent proxy; the policy boundary is at signing
+      -- time, not at draft time. The sidecar is treated as malicious;
+      -- draft validity is re-checked when the user picks one.
+      let resp ← LeanKohaku.LlmAgent.Bridge.call
+        { method := "tx.draftFromIntent", params := req.params, id := 0 }
+      pure <| .ok <| LeanKohaku.LlmAgent.Bridge.responseToJson resp
   | "tx.simulate" =>
       -- Why: dry-run a transaction against the RPC node before signing.
       -- Combines eth_call (catches revert + returns return-data) and
@@ -1776,10 +1982,58 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
               let txObj : Json := .obj <|
                 (match from? with | some f => #[("from", .str f)] | none => #[])
                 ++ #[("to", .str to), ("value", .str value), ("data", .str data)]
+              let chainIdForVia :=
+                ((getField "chainId" req.params) >>= asNat).getD cfg.chainId
+              let via? ← colibriVia state chainIdForVia
               let callRes ← LeanKohaku.RPC.Outbound.call cfg.policy endpoint
-                .call (.arr #[txObj, .str block])
+                .call (.arr #[txObj, .str block]) via?
               let gasRes ← LeanKohaku.RPC.Outbound.estimateGas
-                cfg.policy endpoint txObj block
+                cfg.policy endpoint txObj block via?
+              -- Opt-in `debug_traceCall` with the callTracer + log capture.
+              -- Many public RPCs don't expose `debug_*` namespaces; we
+              -- surface the failure as `traceUnavailable` so callers can
+              -- gracefully degrade to the eth_call-only output. The trace
+              -- itself is returned raw — TUI consumers parse Transfer events
+              -- (topic[0] = 0xddf252ad...) downstream to render which
+              -- tokens move pre-sign.
+              let traceFlag := ((getField "trace" req.params) >>= asBool).getD false
+              let chainIdForMeta :=
+                ((getField "chainId" req.params) >>= asNat).getD cfg.chainId
+              -- traceField holds either `[("trace", ...)]`, `[("trace",...),
+              -- ("tokenMetadata", ...)]`, or `[("traceUnavailable", ...)]`.
+              let traceField : Array (String × Json) ←
+                if traceFlag then
+                  let traceCfg : Json := .obj #[
+                    ("tracer", .str "callTracer"),
+                    ("tracerConfig", .obj #[("withLog", .bool true)])
+                  ]
+                  let traceParams : Json := .arr #[txObj, .str block, traceCfg]
+                  match ← LeanKohaku.RPC.Outbound.call cfg.policy endpoint
+                      .debugTraceCall traceParams with
+                  | .ok traceJson =>
+                      -- Prefetch metadata for every token that emits a
+                      -- Transfer log inside the trace. Dedup by lowercased
+                      -- address so we make one eth_call per token, not per
+                      -- transfer event. Failures are silent — TransfersBlock
+                      -- gracefully falls back to raw uint256 + short addr.
+                      let allTokens := collectTransferTokens traceJson
+                      let mut seen : Array String := #[]
+                      let mut tmObj : Array (String × Json) := #[]
+                      for raw in allTokens do
+                        let lo := raw.toLower
+                        if seen.contains lo then continue
+                        seen := seen.push lo
+                        match ← LeanKohaku.Daemon.TokenMeta.lookupOrFetch
+                            state cfg.policy endpoint chainIdForMeta raw with
+                        | some m =>
+                            tmObj := tmObj.push (lo,
+                              LeanKohaku.Daemon.TokenMeta.toJson m)
+                        | none => pure ()
+                      pure #[("trace", traceJson),
+                             ("tokenMetadata", .obj tmObj)]
+                  | .error e => pure #[("traceUnavailable", Json.str e)]
+                else
+                  pure #[]
               let okBool := match callRes with | .ok _ => true | .error _ => false
               let returnField : Array (String × Json) := match callRes with
                 | .ok j => #[("returnData", j)]
@@ -1790,15 +2044,84 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
               let gasField : Array (String × Json) := match gasRes with
                 | .ok j => #[("gasEstimate", j)]
                 | .error e =>
-                    -- Gas estimate failure on a successful eth_call is rare
-                    -- but possible (e.g. node is in archive-only mode); keep
-                    -- it informational rather than failing the whole call.
                     #[("gasEstimateError", Json.str e)]
               pure <| .ok <| .obj <| #[
                 ("ok", .bool okBool),
                 ("block", .str block),
                 ("tx", txObj)
-              ] ++ returnField ++ revertField ++ gasField
+              ] ++ returnField ++ revertField ++ gasField ++ traceField
+  | "tx.simulateColibri" =>
+      -- Why: same role as `tx.simulate` (pre-sign dry run) but executed
+      -- inside the Colibri stateless light client. EVM runs locally in
+      -- WASM; missing state is pulled via committee-signed Merkle proofs.
+      -- Prefers the persistent client when one is running (no cold start);
+      -- falls back to a fresh one-shot spawn otherwise. Output is UNTRUSTED
+      -- for signing decisions — the ConfirmGate uses it as confirmation
+      -- copy only; the signed tx is re-decoded in Lean before broadcast.
+      match ← LeanKohaku.Daemon.State.colibriClient? state with
+      | some c =>
+          let resp ← LeanKohaku.Colibri.Persistent.call c "tx.simulate" req.params
+          pure <| .ok <| LeanKohaku.Colibri.Persistent.responseToJson resp
+      | none =>
+          let resp ← LeanKohaku.Colibri.Bridge.call
+            { method := "tx.simulate", params := req.params, id := 0 }
+          pure <| .ok <| LeanKohaku.Colibri.Bridge.responseToJson resp
+  | "eth.proxyVerified" =>
+      -- Why: generic verified-read surface. Forwards { chainId, method,
+      -- params } through the persistent Colibri client so callers (TUI,
+      -- agents) can fetch eth_getBalance / eth_call / eth_getLogs / etc.
+      -- with consensus-verified results. Only available while the
+      -- persistent client is running; returns a clear error otherwise so
+      -- callers can fall back to the untrusted-RPC path.
+      match ← LeanKohaku.Daemon.State.colibriClient? state with
+      | some c =>
+          let resp ← LeanKohaku.Colibri.Persistent.call c "eth.proxy" req.params
+          pure <| .ok <| LeanKohaku.Colibri.Persistent.responseToJson resp
+      | none =>
+          pure <| .error {
+            code := -32099,
+            message := "colibri client not running",
+            data := some (.str "call daemon.colibri.toggle { enable: true } first")
+          }
+  | "daemon.colibri.toggle" =>
+      -- Why: spawn or tear down the persistent Colibri client at runtime.
+      -- Toggling is idempotent. The cost is paid here (sync-committee
+      -- bootstrap on the first request after spawn) rather than on every
+      -- read call. Falls back to the legacy one-shot path when off.
+      let enable := ((getField "enable" req.params) >>= asBool).getD true
+      if enable then
+        -- Mirror Daemon.Config.runtimeDir; we can't import Config here
+        -- (Config depends on Server, would cycle). Same XDG_RUNTIME_DIR /
+        -- /tmp fallback semantics.
+        let runtimeRoot := match ← IO.getEnv "XDG_RUNTIME_DIR" with
+          | some d => d
+          | none => "/tmp"
+        let socketPath := s!"{runtimeRoot}/leankohaku/colibri.sock"
+        try
+          let _ ← LeanKohaku.Daemon.State.colibriEnable state socketPath
+          pure <| .ok <| .obj #[
+            ("ok", .bool true),
+            ("running", .bool true),
+            ("socket", .str socketPath)
+          ]
+        catch e =>
+          pure <| .error {
+            code := -32099,
+            message := s!"failed to start colibri: {e}",
+            data := none
+          }
+      else
+        LeanKohaku.Daemon.State.colibriDisable state
+        pure <| .ok <| .obj #[("ok", .bool true), ("running", .bool false)]
+  | "daemon.colibri.status" =>
+      match ← LeanKohaku.Daemon.State.colibriClient? state with
+      | some c =>
+          pure <| .ok <| .obj #[
+            ("running", .bool true),
+            ("socket", .str c.socket)
+          ]
+      | none =>
+          pure <| .ok <| .obj #[("running", .bool false)]
   | "tx.decodeIntent" =>
       -- Why: forwards { chainId, to, value, data, from? } to the clearsign
       -- sidecar. Before forwarding, prefetch ERC-20 metadata for `to` so
@@ -1811,7 +2134,7 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
         ((getField "to" req.params) >>= asString).getD ""
       let mut tokenMeta : Json := .obj #[]
       if !toParam.isEmpty then
-        let ep := cfg.rpcEndpoint
+        let ep := chainEndpointFor cfg req.params chainIdParam
         match ← LeanKohaku.Daemon.TokenMeta.lookupOrFetch
             state cfg.policy ep chainIdParam toParam with
         | some m =>
@@ -1826,6 +2149,45 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
         | other => other
       let resp ← LeanKohaku.Clearsign.Bridge.call
         { method := "tx.decodeIntent", params := augmented, id := 0 }
+      pure <| .ok <| LeanKohaku.Clearsign.Bridge.responseToJson resp
+  | "eip712.decodeIntent" =>
+      -- Why: same architecture as tx.decodeIntent — daemon prefetches token
+      -- metadata for any addresses we can identify cheaply (sellToken/
+      -- buyToken in CowSwap-style orders, token in Permit2 EIP-712), then
+      -- forwards to the clearsign sidecar with a `tokenMetadata` map. The
+      -- sidecar walks the descriptor against `message`.
+      let chainIdParam :=
+        ((getField "chainId" req.params) >>= asNat).getD cfg.chainId
+      let messageObj := (getField "message" req.params).getD (.obj #[])
+      -- Pull every address-shaped string out of the (top-level) message
+      -- and prefetch metadata for it. This is cheap and covers the common
+      -- token-bearing fields without descriptor-aware path resolution.
+      let addrs : Array String :=
+        match messageObj with
+        | .obj fields =>
+            fields.filterMap (fun (_, v) =>
+              match v with
+              | .str s =>
+                  if s.startsWith "0x" && s.length = 42 then some s else none
+              | _ => none)
+        | _ => #[]
+      let mut tmObj : Array (String × Json) := #[]
+      let ep := chainEndpointFor cfg req.params chainIdParam
+      for addr in addrs do
+        match ← LeanKohaku.Daemon.TokenMeta.lookupOrFetch
+            state cfg.policy ep chainIdParam addr with
+        | some m =>
+            tmObj := tmObj.push (addr.toLower,
+              LeanKohaku.Daemon.TokenMeta.toJson m)
+        | none => pure ()
+      let augmented : Json :=
+        match req.params with
+        | .obj fields =>
+            .obj (fields.filter (fun (k, _) => k != "tokenMetadata")
+              ++ #[("tokenMetadata", .obj tmObj)])
+        | other => other
+      let resp ← LeanKohaku.Clearsign.Bridge.call
+        { method := "eip712.decodeIntent", params := augmented, id := 0 }
       pure <| .ok <| LeanKohaku.Clearsign.Bridge.responseToJson resp
   | "shielded.balance" =>
       match paramString req.params "passphrase" with
@@ -1987,6 +2349,9 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
                     match ← IO.getEnv "KOHAKU_GETLOGS_MAX_BLOCK_SPAN" with
                     | some s => pure (s.toNat?.getD 5000)
                     | none => pure 5000
+              let chainIdForScan :=
+                ((getField "chainId" req.params) >>= asNat).getD cfg.chainId
+              let viaScan? ← colibriVia state chainIdForScan
               -- Resolve fromBlock/toBlock.
               let fromBlock ← do
                 match getField "fromBlock" req.params >>= asNat with
@@ -1996,7 +2361,7 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
                 match getField "toBlock" req.params >>= asNat with
                 | some n => pure n
                 | none =>
-                    match ← LeanKohaku.RPC.Outbound.blockNumber cfg.policy scanEndpoint with
+                    match ← LeanKohaku.RPC.Outbound.blockNumber cfg.policy scanEndpoint viaScan? with
                     | .ok j =>
                         pure ((asString j >>= parseHexQuantity).getD 0)
                     | .error _ => pure 0
@@ -2062,7 +2427,7 @@ def methodHandler (cfg : Config) (state : LeanKohaku.Daemon.State.Shared)
                                 ("fromBlock", .str fromHex),
                                 ("toBlock", .str toHex),
                                 ("topics", .arr topicsArr)
-                              ]]) with
+                              ]]) viaScan? with
                           | .error e => errAcc := some e
                           | .ok logsJson =>
                               match asArray logsJson with
@@ -2454,6 +2819,9 @@ def run (cfg : Config) : IO Unit := do
   try
     acceptLoop cfg state listener
   finally
+    -- Tear down persistent sidecars before releasing the listener so we
+    -- don't leak the colibri.sock file (and the Node child) on shutdown.
+    LeanKohaku.Daemon.State.colibriDisable state
     LeanKohaku.Daemon.Uds.closeListener listener
     if ownsSocket then
       removeSocketFile cfg.socketPath

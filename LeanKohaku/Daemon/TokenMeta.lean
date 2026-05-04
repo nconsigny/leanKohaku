@@ -106,8 +106,11 @@ def fetchAndCache
     (policy : LeanKohaku.Privacy.NetworkPolicy.Policy)
     (endpoint : LeanKohaku.RPC.Outbound.Endpoint)
     (chainId : Nat) (address : String) : IO (Option TokenMeta) := do
-  let decRes ← LeanKohaku.RPC.Outbound.ethCall policy endpoint address decimalsSelector
-  let symRes ← LeanKohaku.RPC.Outbound.ethCall policy endpoint address symbolSelector
+  -- Route through Colibri when the persistent client is up so token
+  -- metadata reads are committee-verified, same as balances/calls.
+  let via? ← (← state.get).colibri.mapM (fun c => pure (c, chainId))
+  let decRes ← LeanKohaku.RPC.Outbound.ethCall policy endpoint address decimalsSelector "latest" via?
+  let symRes ← LeanKohaku.RPC.Outbound.ethCall policy endpoint address symbolSelector "latest" via?
   match decRes, symRes with
   | .ok decJson, .ok symJson =>
       let decHex := (LeanKohaku.Encoding.Json.asString decJson).getD ""

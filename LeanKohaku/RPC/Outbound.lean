@@ -2,6 +2,7 @@ import LeanKohaku.Encoding.Json
 import LeanKohaku.Network.Provider
 import LeanKohaku.Privacy.NetworkPolicy
 import LeanKohaku.RPC.JsonRpc
+import LeanKohaku.Colibri.Persistent
 
 /-!
 # Daemon outbound Ethereum JSON-RPC
@@ -115,13 +116,78 @@ private def logEvent (kind method : String) (extra : Array (String × Json)) : I
       ("method", .str method)] ++ extra
   appendNetLog (compact (.obj fields))
 
+/-- Optional verified-read backend. When `some (client, chainId)` is
+    supplied AND the method is proofable, the request is routed through
+    the Colibri stateless light client over the persistent UDS instead of
+    the configured HTTP endpoint. State is pulled via committee-signed
+    Merkle proofs, so the result is verified against consensus. Non-
+    proofable methods (sendRawTransaction, debug_traceCall) always go
+    over HTTP regardless. -/
+abbrev VerifyVia := LeanKohaku.Colibri.Persistent.Client × Nat
+
+private def callViaColibri (client : LeanKohaku.Colibri.Persistent.Client)
+    (chainId : Nat) (method : RpcMethod) (params : Json) :
+    IO (Except String Json) := do
+  -- Colibri's eth.proxy expects params as an array; eth_* params are
+  -- already arrays in our Outbound surface, so pass through as-is.
+  let proxyParams : Json := .obj #[
+    ("chainId", .num (Int.ofNat chainId)),
+    ("method", .str method.asString),
+    ("params", params)
+  ]
+  let resp ← LeanKohaku.Colibri.Persistent.call client "eth.proxy" proxyParams
+  match resp with
+  | .ok j => pure (.ok j)
+  | .err code msg _ => pure (.error s!"colibri rpc-error code={code}: {msg}")
+  | .crash reason => pure (.error s!"colibri transport: {reason}")
+
 /-- Invariant: every daemon call site must pass `cfg.rpcEndpoint` (the
 endpoint resolved at startup from `LEANKOHAKU_RPC_URL` / `daemon.json`).
 There is no implicit fallback: `Daemon.Config.resolve` errors out when no
 URL is configured, so a non-empty `endpoint.url` here was sourced from
-user configuration. We additionally fail closed on an empty URL. -/
+user configuration. We additionally fail closed on an empty URL.
+
+When `via?` is supplied AND the method is `RpcMethod.proofable`, the call
+is satisfied by the Colibri light client. The HTTP path is still used for
+non-proofable methods (writes / debug tracers) even with `via?` set. -/
 def call (policy : Policy) (endpoint : Endpoint) (method : RpcMethod)
-    (params : Json) : IO (Except String Json) := do
+    (params : Json) (via? : Option VerifyVia := none) :
+    IO (Except String Json) := do
+  -- Route proofable reads through the persistent Colibri client when
+  -- enabled. Logged through the same network log so audit trails stay
+  -- coherent — the entry just shows backend=colibri.
+  match via? with
+  | some (client, chainId) =>
+      if method.proofable then
+        let t0 ← IO.monoMsNow
+        let v ← verboseLevel
+        if v ≥ 1 then
+          let paramsRender := if v ≥ 2 then compact params else "..."
+          IO.eprintln s!"[rpc→colibri] {method.asString} chainId={chainId} params={paramsRender}"
+        logEvent "request" method.asString
+          #[("backend", .str "colibri"),
+            ("chainId", .num (Int.ofNat chainId)),
+            ("params", params)]
+        let result ← callViaColibri client chainId method params
+        let dt := (← IO.monoMsNow) - t0
+        match result with
+        | .ok j =>
+            if v ≥ 1 then
+              let resRender := if v ≥ 2 then s!" result={compact j}" else ""
+              IO.eprintln s!"[rpc←colibri] {method.asString} {dt}ms ok{resRender}"
+            logEvent "response" method.asString
+              #[("backend", .str "colibri"),
+                ("ms", .num (Int.ofNat dt)),
+                ("result", j)]
+            return .ok j
+        | .error e =>
+            if v ≥ 1 then IO.eprintln s!"[rpc✗colibri] {method.asString} {dt}ms {e}"
+            logEvent "rpc-error" method.asString
+              #[("backend", .str "colibri"),
+                ("ms", .num (Int.ofNat dt)),
+                ("error", .str e)]
+            return .error e
+  | none => pure ()
   if endpoint.url.trim.isEmpty then
     return .error "no rpc_url configured: refusing to dial (set LEANKOHAKU_RPC_URL or 'rpc_url' in daemon.json)"
   unless requestAllowed policy endpoint method do
@@ -177,46 +243,55 @@ def call (policy : Policy) (endpoint : Endpoint) (method : RpcMethod)
     pure (.error e.toString)
 
 def getBalance (policy : Policy) (endpoint : Endpoint)
-    (address : String) (block : String := "latest") : IO (Except String Json) :=
-  call policy endpoint .getBalance (.arr #[.str address, .str block])
+    (address : String) (block : String := "latest")
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
+  call policy endpoint .getBalance (.arr #[.str address, .str block]) via?
 
 def getTransactionCount (policy : Policy) (endpoint : Endpoint)
-    (address : String) (block : String := "latest") : IO (Except String Json) :=
-  call policy endpoint .getTransactionCount (.arr #[.str address, .str block])
+    (address : String) (block : String := "latest")
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
+  call policy endpoint .getTransactionCount (.arr #[.str address, .str block]) via?
 
-def gasPrice (policy : Policy) (endpoint : Endpoint) : IO (Except String Json) :=
-  call policy endpoint .gasPrice (.arr #[])
+def gasPrice (policy : Policy) (endpoint : Endpoint)
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
+  call policy endpoint .gasPrice (.arr #[]) via?
 
-def maxPriorityFeePerGas (policy : Policy) (endpoint : Endpoint) : IO (Except String Json) :=
-  call policy endpoint .maxPriorityFeePerGas (.arr #[])
+def maxPriorityFeePerGas (policy : Policy) (endpoint : Endpoint)
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
+  call policy endpoint .maxPriorityFeePerGas (.arr #[]) via?
 
 def estimateGas (policy : Policy) (endpoint : Endpoint) (tx : Json)
-    (block : String := "latest") : IO (Except String Json) :=
-  call policy endpoint .estimateGas (.arr #[tx, .str block])
+    (block : String := "latest")
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
+  call policy endpoint .estimateGas (.arr #[tx, .str block]) via?
 
 def ethCall (policy : Policy) (endpoint : Endpoint)
-    (to data : String) (block : String := "latest") : IO (Except String Json) :=
+    (to data : String) (block : String := "latest")
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
   call policy endpoint .call
     (.arr #[
       .obj #[("to", .str to), ("data", .str data)],
       .str block
-    ])
+    ]) via?
 
 def sendRawTransaction (policy : Policy) (endpoint : Endpoint)
     (rawTx : String) : IO (Except String Json) :=
+  -- Writes never proofable; never accepts via?.
   call policy endpoint .sendRawTransaction (.arr #[.str rawTx])
 
 def getTransactionReceipt (policy : Policy) (endpoint : Endpoint)
-    (txHash : String) : IO (Except String Json) :=
-  call policy endpoint .getTransactionReceipt (.arr #[.str txHash])
+    (txHash : String) (via? : Option VerifyVia := none) :
+    IO (Except String Json) :=
+  call policy endpoint .getTransactionReceipt (.arr #[.str txHash]) via?
 
-def blockNumber (policy : Policy) (endpoint : Endpoint) : IO (Except String Json) :=
-  call policy endpoint .blockNumber (.arr #[])
+def blockNumber (policy : Policy) (endpoint : Endpoint)
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
+  call policy endpoint .blockNumber (.arr #[]) via?
 
 /-- Single eth_getLogs query with explicit block range, address, and topics. -/
 def getLogs (policy : Policy) (endpoint : Endpoint)
-    (fromBlockHex toBlockHex address : String) (topics : Array Json) :
-    IO (Except String Json) :=
+    (fromBlockHex toBlockHex address : String) (topics : Array Json)
+    (via? : Option VerifyVia := none) : IO (Except String Json) :=
   call policy endpoint .getLogs
     (.arr #[
       .obj #[
@@ -225,6 +300,6 @@ def getLogs (policy : Policy) (endpoint : Endpoint)
         ("address", .str address),
         ("topics", .arr topics)
       ]
-    ])
+    ]) via?
 
 end LeanKohaku.RPC.Outbound

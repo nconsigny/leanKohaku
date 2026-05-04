@@ -1,5 +1,6 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useApp } from "ink";
+import { call } from "./daemon.js";
 import MainMenu, { MainAction } from "./screens/MainMenu.js";
 import WalletList from "./screens/WalletList.js";
 import ActionPicker, { Action as WalletAction } from "./screens/ActionPicker.js";
@@ -11,6 +12,9 @@ import ImportEoaFlow from "./screens/ImportEoaFlow.js";
 import CreateWalletPicker, { CreateKind } from "./screens/CreateWalletPicker.js";
 import ImportWalletPicker, { ImportKind } from "./screens/ImportWalletPicker.js";
 import DecodeIntentFlow from "./screens/DecodeIntentFlow.js";
+import LlmDraftFlow from "./screens/LlmDraftFlow.js";
+import SendRawFlow from "./screens/SendRawFlow.js";
+import DecodeTypedDataFlow from "./screens/DecodeTypedDataFlow.js";
 import RevealMnemonicFlow from "./screens/RevealMnemonicFlow.js";
 import PrivacyMenu from "./screens/PrivacyMenu.js";
 import {
@@ -44,7 +48,14 @@ type Screen =
   | { kind: "resolve" }
   | { kind: "daemon" }
   | { kind: "more" }
-  | { kind: "decode-intent" };
+  | { kind: "decode-intent" }
+  | { kind: "llm-draft" }
+  | { kind: "decode-typed-data" }
+  | {
+      kind: "send-raw";
+      tx: { to: string; value: string; data: string; rationale?: string };
+      chainId: number;
+    };
 
 /** Stack-based screen navigator. Push on navigate, pop on Esc/back; the
  *  bottom of the stack is the main menu so Quit always exits the app. */
@@ -52,6 +63,42 @@ export default function App() {
   const { exit } = useApp();
   const [stack, setStack] = useState<Screen[]>([{ kind: "main" }]);
   const [walletsRefreshKey, setWalletsRefreshKey] = useState(0);
+  // Colibri stateless simulation runs the EVM locally inside a WASM light
+  // client with committee-verified state proofs. Toggling here sends
+  // daemon.colibri.toggle so the persistent sidecar lifecycle is owned by
+  // the daemon (one bootstrap, reused across calls). Initial state pulls
+  // from daemon.colibri.status; the env var is a convenience auto-enable
+  // for power users.
+  const [colibriEnabled, setColibriEnabled] = useState(false);
+  const [colibriPending, setColibriPending] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const r = await call<{ running?: boolean }>("daemon.colibri.status", {});
+      if (cancelled) return;
+      if (r.ok && r.result?.running) setColibriEnabled(true);
+      else if (process.env.KOHAKU_COLIBRI === "1") {
+        // Power-user auto-enable: ask the daemon to spawn one.
+        await call("daemon.colibri.toggle", { enable: true });
+        if (!cancelled) setColibriEnabled(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const toggleColibri = async () => {
+    if (colibriPending) return;
+    setColibriPending(true);
+    const target = !colibriEnabled;
+    const r = await call<{ running?: boolean }>("daemon.colibri.toggle", {
+      enable: target,
+    });
+    if (r.ok) setColibriEnabled(r.result?.running === true);
+    setColibriPending(false);
+  };
 
   const top = stack[stack.length - 1]!;
   const push = (s: Screen) => setStack((prev) => [...prev, s]);
@@ -66,6 +113,7 @@ export default function App() {
       case "import-wallet":   return push({ kind: "import-wallet" });
       case "privacy":         return push({ kind: "privacy" });
       case "daemon":          return push({ kind: "daemon" });
+      case "toggle-colibri":  return void toggleColibri();
       case "more":            return push({ kind: "more" });
       case "quit":            return exit();
     }
@@ -108,7 +156,13 @@ export default function App() {
 
   switch (top.kind) {
     case "main":
-      return <MainMenu onPick={handleMain} />;
+      return (
+        <MainMenu
+          onPick={handleMain}
+          colibriEnabled={colibriEnabled}
+          colibriPending={colibriPending}
+        />
+      );
     case "wallets":
       return (
         <WalletList
@@ -126,7 +180,13 @@ export default function App() {
         />
       );
     case "send":
-      return <SendFlow wallet={top.wallet} onDone={finishAction} />;
+      return (
+        <SendFlow
+          wallet={top.wallet}
+          colibriEnabled={colibriEnabled}
+          onDone={finishAction}
+        />
+      );
     case "shield":
       return <ShieldFlow wallet={top.wallet} onDone={finishAction} />;
     case "lock-toggle":
@@ -162,10 +222,29 @@ export default function App() {
           onPick={(a) => {
             if (a === "resolve") push({ kind: "resolve" });
             else if (a === "decode-intent") push({ kind: "decode-intent" });
+            else if (a === "llm-draft") push({ kind: "llm-draft" });
+            else if (a === "decode-typed-data") push({ kind: "decode-typed-data" });
           }}
         />
       );
     case "decode-intent":
       return <DecodeIntentFlow onDone={pop} />;
+    case "llm-draft":
+      return (
+        <LlmDraftFlow
+          onDone={pop}
+          onApprove={(tx, chainId) => push({ kind: "send-raw", tx, chainId })}
+        />
+      );
+    case "send-raw":
+      return (
+        <SendRawFlow
+          tx={top.tx}
+          chainId={top.chainId}
+          onDone={finishAction}
+        />
+      );
+    case "decode-typed-data":
+      return <DecodeTypedDataFlow onDone={pop} />;
   }
 }

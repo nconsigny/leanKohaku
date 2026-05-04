@@ -150,6 +150,47 @@ binaries invoked at runtime.
   `docs/R1_SEPOLIA.md`, `SECURITY.md` — user
   documentation.
 
+### Sidecar bridges (`bridge/`)
+
+Three Node sidecars sit outside the Lean tree. Each one is one-shot stdio
+JSON-RPC: the daemon spawns the binary per call with the request as
+`--rpc <json>` on argv, reads one line of stdout, and reaps. The Lean spawn
+modules listed below are the **only** places that fork them; every output is
+treated as untrusted and re-validated.
+
+| Bridge | Lean wrapper | Executable env var | Purpose |
+|---|---|---|---|
+| `bridge/` | `LeanKohaku/Privacy/Bridge.lean` | `LEAN_KOHAKU_BRIDGE` | Privacy Pools / Railgun (snarkjs, libp2p) |
+| `bridge/clearsign/` | `LeanKohaku/Clearsign/Bridge.lean` | `LEAN_KOHAKU_CLEARSIGN_BRIDGE` | ERC-7730 calldata + EIP-712 walker |
+| `bridge/llm/` | `LeanKohaku/LlmAgent/Bridge.lean` | `LEAN_KOHAKU_LLM_BRIDGE` | NL → tx-draft candidates (Anthropic SDK + viem); `ANTHROPIC_API_KEY` enables the model fallback |
+
+The clearsign sidecar bundles ERC-7730 descriptors under
+`bridge/clearsign/registry/` (ERC-20, Uniswap V3 SwapRouter02, Permit2,
+CowSwap order EIP-712, plus a `4byte.json` fallback dict). The LLM sidecar
+bundles `KNOWN_TOKENS` and `KNOWN_PROTOCOLS` (Aave V3 Pool, Morpho Blue,
+Uniswap V3 QuoterV2/Router02 per chain) and opens UDS back to the daemon
+socket via `bridge/llm/src/daemon-callback.mjs` so its tools can read chain
+state under the daemon's policy gate.
+
+### Terminal UI (`tui/`)
+
+`tui/` is an Ink-based TUI bundled with esbuild to a single
+`dist/index.mjs`. Reachable via `kohaku tui`; the launcher in
+`Cli/Runtime.lean` resolves the bundle from `<bin>/../share/leankohaku/tui/`
+or the local dev path. Notable screens:
+
+- **MainMenu** — Wallets / Create / Import / Privacy Pools / Daemon / More.
+- **Wallets → ActionPicker** — Send / Shield / History / Lock-toggle / etc.
+- **SendFlow** — EOA send goes unlock → simulate → `ConfirmGate` → sign.
+  TPM/R1 send routes through `r1.sendEthSepolia`. Both render token
+  movements via `widgets/TransfersBlock.tsx` (parses `tx.simulate`'s trace).
+- **SendRawFlow** — generic confirm-and-sign for arbitrary `{to, value,
+  data}`; reused by the LLM agent's "approve & sign" handoff.
+- **DecodeIntentFlow** / **DecodeTypedDataFlow** — paste calldata or
+  EIP-712 JSON, see the rendered intent + simulator output. Read-only.
+- **LlmDraftFlow** — natural-language prompt → drafts → review with decode +
+  sim → "Approve & sign" pushes to `SendRawFlow`.
+
 ## Trust boundary summary
 
 Inside Lean and provable: hex/RLP/JSON encoding, address derivation logic,

@@ -31,6 +31,7 @@ inductive RpcMethod where
   | sendRawTransaction
   | getTransactionReceipt
   | getLogs
+  | debugTraceCall
   deriving DecidableEq, Repr
 
 def RpcMethod.asString : RpcMethod → String
@@ -46,6 +47,7 @@ def RpcMethod.asString : RpcMethod → String
   | .sendRawTransaction => "eth_sendRawTransaction"
   | .getTransactionReceipt => "eth_getTransactionReceipt"
   | .getLogs => "eth_getLogs"
+  | .debugTraceCall => "debug_traceCall"
 
 def Backend.asString : Backend → String
   | .localNode => "local"
@@ -55,6 +57,14 @@ def Backend.asString : Backend → String
 def RpcMethod.purpose : RpcMethod → Purpose
   | .sendRawTransaction => .broadcastTx
   | _ => .nodeRead
+
+/-- Whether the method can be served by a stateless light client (state
+    pulled via committee-signed Merkle proofs). Writes and debug tracers
+    can't be — those always go through the configured RPC. -/
+def RpcMethod.proofable : RpcMethod → Bool
+  | .sendRawTransaction => false
+  | .debugTraceCall     => false
+  | _                   => true
 
 structure Config where
   backend   : Backend
@@ -101,6 +111,7 @@ def parseRpcMethod : String → Option RpcMethod
   | "eth_sendRawTransaction" => some .sendRawTransaction
   | "eth_getTransactionReceipt" => some .getTransactionReceipt
   | "eth_getLogs" => some .getLogs
+  | "debug_traceCall" => some .debugTraceCall
   | _ => none
 
 def backendNames : List String := ["local", "light", "configured"]
@@ -109,6 +120,6 @@ def rpcMethodNames : List String :=
   ["eth_chainId", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount",
     "eth_getCode", "eth_call", "eth_estimateGas", "eth_gasPrice",
     "eth_maxPriorityFeePerGas", "eth_sendRawTransaction",
-    "eth_getTransactionReceipt", "eth_getLogs"]
+    "eth_getTransactionReceipt", "eth_getLogs", "debug_traceCall"]
 
 end LeanKohaku.Network.Provider

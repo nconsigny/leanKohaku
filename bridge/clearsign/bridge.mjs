@@ -10,6 +10,7 @@
 
 import { loadRegistry } from "./src/registry.mjs";
 import { decodeTxIntent } from "./src/decoder.mjs";
+import { decodeEip712Intent } from "./src/eip712.mjs";
 
 const PROTOCOL_VERSION = "0.0.1";
 
@@ -70,7 +71,25 @@ function dispatch(method, params, id) {
       }
     }
 
-    // Phase 2: eip712.decodeIntent (descriptor lookup by domain) goes here.
+    case "eip712.decodeIntent": {
+      if (!params || typeof params !== "object") {
+        return err(id, -32602, "params must be an object");
+      }
+      if (typeof params.primaryType !== "string" || typeof params.types !== "object") {
+        return err(id, -32602, "params.primaryType (string) and params.types (object) required");
+      }
+      if (!params.domain || typeof params.domain !== "object") {
+        return err(id, -32602, "params.domain (object) required");
+      }
+      try {
+        const result = decodeEip712Intent(params, REGISTRY);
+        return ok(id, result);
+      } catch (e) {
+        return err(id, -32603, `eip712 decode failed: ${e?.message ?? e}`, {
+          stack: String(e?.stack ?? ""),
+        });
+      }
+    }
 
     default:
       return err(id, -32601, `method not found: ${method}`);

@@ -1,8 +1,11 @@
 # leanKohaku
 
 A formally-verified Ethereum wallet daemon written entirely in **Lean 4**,
-with a CLI-first surface. Zrchitected from the ground up for machine-checked proofs of the
-critical signing path.
+with a CLI-first surface and an Ink-based TUI. Architected from the ground up
+for machine-checked proofs of the critical signing path, with every "produces
+calldata" surface (paste, ERC-7730 decode, LLM agent) gated through a
+decode → simulate → user-confirm pipeline before any private key touches the
+transaction.
 
 ## Goals
 
@@ -43,8 +46,12 @@ critical signing path.
 ## Non-goals (for now)
 
 - Browser / mobile UI.
-- Multi-LLM agent orchestration
 - Production readiness — this is a research wallet.
+- WalletConnect / OpenLV transport. We deliberately bypass dApp integrations:
+  the LLM agent (`bridge/llm/`) drafts calldata in natural language; the
+  ERC-7730 walker (`bridge/clearsign/`) renders intent for any pasted
+  calldata; the simulator surfaces what tokens actually move. The user
+  confirms ground-truth simulated effects, not dApp marketing copy.
 
 ## Layout
 
@@ -55,20 +62,30 @@ leanKohaku/
 ├─ flake.nix / default.nix        # Nix package scaffold
 ├─ LeanKohaku.lean                # Root module (re-exports)
 ├─ LeanKohaku/
-│  ├─ App/        CLI and daemon executable roots
-│  ├─ Lib/        Client/Core/Spec aggregate roots
+│  ├─ App/         CLI and daemon executable roots
+│  ├─ Lib/         Client/Core/Spec aggregate roots
 │  ├─ Basic.lean
-│  ├─ Crypto/      Hex, Secp256k1 scaffolding
-│  ├─ Ethereum/    Address, Chain, P256Precompile, Tx
-│  ├─ Privacy/     NetworkPolicy
-│  ├─ Network/     Endpoint, Provider
-│  ├─ Keystore/    Enclave, Linux
+│  ├─ Crypto/      Hex, Secp256k1, HACL scaffolding
+│  ├─ Encoding/    Json, Rlp
+│  ├─ Ethereum/    Address, Chain, P256Precompile, Tx, Abi, Eip712, Ens
+│  ├─ Privacy/     NetworkPolicy, Bridge (Privacy Pools sidecar)
+│  ├─ Clearsign/   Bridge (ERC-7730 + EIP-712 sidecar)
+│  ├─ LlmAgent/    Bridge (NL → tx draft sidecar)
+│  ├─ Network/     Endpoint, Provider (incl. debug_traceCall)
+│  ├─ Keystore/    Enclave, Linux, Tpm2Runtime, MasterKey
 │  ├─ Contract/    R1Account
-│  ├─ Wallet/      Account
-│  ├─ RPC/         JsonRpc
-│  ├─ Daemon/      Server
-│  ├─ Cli/         Commands
-│  └─ Invariants/  Amount, Nonce, TxWellFormed
+│  ├─ Wallet/      Account, Bip39Wordlist, Bip44, HDKey, EOA, EoaStore, …
+│  ├─ RPC/         JsonRpc, Outbound, Server
+│  ├─ Daemon/      Config, Log, State, TokenMeta, TxJournal, Uds, Server
+│  ├─ Cli/         Commands, DaemonClient, Passphrase, NetworkConfig
+│  └─ Invariants/  Amount, Wallet, TxWellFormed, Network, …
+├─ bridge/                        # Untrusted Node sidecars (one-shot stdio JSON-RPC)
+│  ├─ <root>/      Privacy Pools / Railgun (snarkjs, libp2p)
+│  ├─ clearsign/   ERC-7730 walker + 4byte fallback + EIP-712 (CowSwap)
+│  └─ llm/         Anthropic SDK tool-use loop (rule-based first; model fallback)
+├─ tui/                           # Ink-based TUI (bundled with esbuild)
+│  └─ src/screens/  MainMenu, SendFlow, SendRawFlow, DecodeIntentFlow,
+│                   DecodeTypedDataFlow, LlmDraftFlow, ConfirmGate, …
 ├─ INVARIANTS.md                  # Living list of properties + proof status
 ├─ packaging/arch/                # Arch Linux PKGBUILD scaffold
 └─ README.md
@@ -173,10 +190,94 @@ Run the main local regression checks with:
 More detail:
 
 - [CLI](./docs/CLI.md)
-- [Daemon](./docs/DAEMON.md)
+- [Daemon](./docs/DAEMON.md) — full RPC catalog
+- [Architecture](./docs/ARCHITECTURE.md) — module map, sidecars, TUI
 - [Security](./SECURITY.md)
 - [Privacy And Security](./docs/PRIVACY_SECURITY.md)
 - [Sepolia R1 Account Dev Flow](./docs/R1_SEPOLIA.md)
+
+## Pre-sign pipeline
+
+Every signing flow flows through the same gate before reaching `eoa.send`
+or `r1.sendEthSepolia`:
+
+```
+  build {to, value, data}
+        ↓
+  tx.decodeIntent  ──→  ERC-7730 descriptor (or 4byte fallback) → human intent
+                          + token-decimals prefetched daemon-side
+        ↓
+  tx.simulate      ──→  eth_call + eth_estimateGas
+                          + (opt) debug_traceCall walked daemon-side
+                          → token movements rendered with real decimals
+        ↓
+  ConfirmGate (TUI) ──→ user inspects intent + sim outcome + transfers
+        ↓                   Esc bails; Enter advances
+  eoa.send / r1.send*  ──→ daemon signs and broadcasts
+```
+
+`SendFlow` and `SendRawFlow` (TUI) implement this pipeline. The LLM agent
+in `bridge/llm/` produces drafted candidates that flow through the same
+gate via `LlmDraftFlow → SendRawFlow`. Pasted calldata flows through
+`DecodeIntentFlow` (read-only) and the same `ConfirmGate` when the user
+chooses to sign.
+
+## ERC-7730 clear-signing
+
+`bridge/clearsign/` is a Node sidecar that walks ERC-7730 descriptors
+(calldata + EIP-712 typed data) for the daemon. Reachable from the TUI's
+**More commands** menu as "Decode transaction (ERC-7730)" and "Decode typed
+data (EIP-712)", and used internally by `tx.decodeIntent` /
+`eip712.decodeIntent` before every confirm screen.
+
+Bundled descriptors today: ERC-20, Uniswap V3 SwapRouter02, Permit2,
+CowSwap order (EIP-712). Unmatched contracts fall back to a small
+`4byte.json` dict (Aave V3 Pool, Compound V3, Uniswap V2 Router, ENS,
+Multicall3, ERC-721/1155). When neither matches, the user sees raw
+calldata + selector — never a fabricated intent.
+
+## LLM agent
+
+`bridge/llm/` turns natural-language prompts ("send 100 USDC to 0xc8A4…",
+"supply 0.1 WETH to Aave on mainnet") into transaction-draft candidates.
+Two-tier backend:
+
+1. **Rule-based matcher** (always on, free, deterministic) — recognizes
+   send / approve / Aave supply+withdraw / Aave withdraw patterns.
+2. **Anthropic Claude tool-use loop** — fires only when the rule matcher
+   misses *and* `ANTHROPIC_API_KEY` is set in the daemon's environment.
+   Tools include `lookup_token`, `lookup_protocol`, `get_eth_balance`,
+   `get_token_balance`, `get_gas_price`, `get_uniswap_v3_quote`,
+   `get_uniswap_v3_multi_hop_quote`, `get_aave_health_factor`,
+   `get_morpho_blue_position`, plus emit-* tools that build the actual
+   calldata via viem. Read tools route back into the daemon over UDS so
+   every chain RPC is policy-gated identically to CLI/TUI requests.
+
+The trust model is uniform across both tiers: the agent **never signs**.
+Drafts flow through the standard decode → simulate → confirm pipeline. An
+adversarial model (or prompt-injected context) can produce nonsense
+calldata; the worst case is a confusing simulation the user rejects.
+
+## Running the daemon with sidecars
+
+Local development with all three bridges:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-…                                   \
+LEAN_KOHAKU_BRIDGE=$PWD/bridge/bridge.mjs                    \
+LEAN_KOHAKU_CLEARSIGN_BRIDGE=$PWD/bridge/clearsign/bridge.mjs \
+LEAN_KOHAKU_LLM_BRIDGE=$PWD/bridge/llm/bridge.mjs             \
+.lake/build/bin/leankohaku-daemon
+```
+
+Each env var is optional; if a sidecar isn't pointed at, the corresponding
+RPC range fails gracefully with `method not found` or sidecar-spawn errors.
+The TUI bundle is built separately:
+
+```bash
+(cd tui && npm install && npm run build)
+kohaku tui
+```
 
 ## Provider Policy
 

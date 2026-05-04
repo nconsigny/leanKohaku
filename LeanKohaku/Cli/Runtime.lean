@@ -18,18 +18,40 @@ namespace LeanKohaku.Cli
 
 open LeanKohaku.Cli.Commands
 
+/-- Thin wrapper around the daemon's `daemon.preflight` RPC. The policy
+    check + plan summary live daemon-side per CLAUDE.md; the CLI just
+    formats the response. -/
 def printPreflight (action : Action) : IO UInt32 := do
-  if strictCliPreflight action then
-    let daemonReq : DaemonRequest := { action }
-    let plan := strictPlan daemonReq
-    IO.println s!"preflight OK: {actionSummary action}"
-    IO.println "network: local-daemon daemon-control loopback"
-    IO.println s!"daemon-plan: {planSummary plan}"
-    IO.println "preflight only; use daemon-backed wallet commands for execution"
-    return 1
-  else
-    IO.eprintln s!"preflight denied: {actionSummary action}"
-    return 2
+  let params : LeanKohaku.Encoding.Json.Json :=
+    match action with
+    | .balance address =>
+        .obj #[("method", .str "balance"), ("address", .str address)]
+    | .send to amountWei =>
+        .obj #[
+          ("method", .str "send"),
+          ("to", .str to),
+          ("amountWei", .num (Int.ofNat amountWei))
+        ]
+  match ← DaemonClient.call "daemon.preflight" params with
+  | .error err =>
+      IO.eprintln s!"preflight: daemon error {err.code}: {err.message}"
+      return 2
+  | .ok r =>
+      let okBool := (LeanKohaku.Encoding.Json.getField "ok" r
+        >>= LeanKohaku.Encoding.Json.asBool).getD false
+      let summary := (LeanKohaku.Encoding.Json.getField "summary" r
+        >>= LeanKohaku.Encoding.Json.asString).getD ""
+      let plan := (LeanKohaku.Encoding.Json.getField "plan" r
+        >>= LeanKohaku.Encoding.Json.asString).getD ""
+      if okBool then
+        IO.println summary
+        IO.println "network: local-daemon daemon-control loopback"
+        IO.println s!"daemon-plan: {plan}"
+        IO.println "preflight only; use daemon-backed wallet commands for execution"
+        return 1
+      else
+        IO.eprintln summary
+        return 2
 
 def runR1WalletDeploy (keyName chain : String) : IO UInt32 := do
   DaemonClient.printTextResult "tpm.deploy"
@@ -81,69 +103,59 @@ inductive SlotType where
   | tpm
   deriving Repr, DecidableEq
 
+/-! Thin wrappers around the daemon's unified `account.list` RPC.
+
+These three functions used to each call `eoa.list` + `tpm.listSepoliaAddresses`
+and concat the result. The daemon now ships a single `account.list` that
+returns `{ accounts: [{type, name, address, indices?}] }`; the CLI is just
+a pretty-printer per `CLAUDE.md`. -/
+
+private def fetchAccountList : IO (Array LeanKohaku.Encoding.Json.Json) := do
+  match ← DaemonClient.call "account.list" with
+  | .error _ => pure #[]
+  | .ok r =>
+      pure <| (LeanKohaku.Encoding.Json.getField "accounts" r
+        >>= LeanKohaku.Encoding.Json.asArray).getD #[]
+
 /-- Query daemon to figure out whether `name` is an EOA slot or a TPM/R1 slot. -/
 def resolveSlotType (name : String) : IO (Option SlotType) := do
-  match ← DaemonClient.call "eoa.list" with
-  | .ok r =>
-      let entries := (LeanKohaku.Encoding.Json.asArray r).getD #[]
-      let hit := entries.any fun e =>
-        ((LeanKohaku.Encoding.Json.getField "name" e
-          >>= LeanKohaku.Encoding.Json.asString).getD "") = name
-      if hit then return some .eoa
-  | .error _ => pure ()
-  match ← DaemonClient.call "tpm.listSepoliaAddresses" with
-  | .ok r =>
-      let entries := (LeanKohaku.Encoding.Json.asArray r).getD #[]
-      let hit := entries.any fun e =>
-        ((LeanKohaku.Encoding.Json.getField "name" e
-          >>= LeanKohaku.Encoding.Json.asString).getD "") = name
-      if hit then return some .tpm
-  | .error _ => pure ()
+  for e in (← fetchAccountList) do
+    let entryName := (LeanKohaku.Encoding.Json.getField "name" e
+                      >>= LeanKohaku.Encoding.Json.asString).getD ""
+    if entryName = name then
+      let typ := (LeanKohaku.Encoding.Json.getField "type" e
+                  >>= LeanKohaku.Encoding.Json.asString).getD ""
+      match typ with
+      | "eoa" => return some .eoa
+      | "tpm" => return some .tpm
+      | _ => return none
   pure none
 
 /-- Print one wallet name per line; EOA first, then TPM. Used by completion. -/
 def printAccountListNames : IO UInt32 := do
-  match ← DaemonClient.call "eoa.list" with
-  | .ok r =>
-      for e in (LeanKohaku.Encoding.Json.asArray r).getD #[] do
-        let n := (LeanKohaku.Encoding.Json.getField "name" e
-                  >>= LeanKohaku.Encoding.Json.asString).getD ""
-        if !n.isEmpty then IO.println n
-  | .error _ => pure ()
-  match ← DaemonClient.call "tpm.listSepoliaAddresses" with
-  | .ok r =>
-      for e in (LeanKohaku.Encoding.Json.asArray r).getD #[] do
-        let n := (LeanKohaku.Encoding.Json.getField "name" e
-                  >>= LeanKohaku.Encoding.Json.asString).getD ""
-        if !n.isEmpty then IO.println n
-  | .error _ => pure ()
+  for e in (← fetchAccountList) do
+    let n := (LeanKohaku.Encoding.Json.getField "name" e
+              >>= LeanKohaku.Encoding.Json.asString).getD ""
+    if !n.isEmpty then IO.println n
   pure 0
 
 /-- Print `<type>\t<name>` per line — type is `eoa` or `tpm`. Used by
     completion so it can render the `<wallet>/<index>` subaccount form
     only for EOA wallets (TPM/R1 keys have no derivation indices). -/
 def printAccountListTypedNames : IO UInt32 := do
-  match ← DaemonClient.call "eoa.list" with
-  | .ok r =>
-      for e in (LeanKohaku.Encoding.Json.asArray r).getD #[] do
-        let n := (LeanKohaku.Encoding.Json.getField "name" e
-                  >>= LeanKohaku.Encoding.Json.asString).getD ""
-        if !n.isEmpty then IO.println s!"eoa\t{n}"
-  | .error _ => pure ()
-  match ← DaemonClient.call "tpm.listSepoliaAddresses" with
-  | .ok r =>
-      for e in (LeanKohaku.Encoding.Json.asArray r).getD #[] do
-        let n := (LeanKohaku.Encoding.Json.getField "name" e
-                  >>= LeanKohaku.Encoding.Json.asString).getD ""
-        if !n.isEmpty then IO.println s!"tpm\t{n}"
-  | .error _ => pure ()
+  for e in (← fetchAccountList) do
+    let typ := (LeanKohaku.Encoding.Json.getField "type" e
+                >>= LeanKohaku.Encoding.Json.asString).getD ""
+    let n := (LeanKohaku.Encoding.Json.getField "name" e
+              >>= LeanKohaku.Encoding.Json.asString).getD ""
+    if !n.isEmpty && !typ.isEmpty then IO.println s!"{typ}\t{n}"
   pure 0
 
 /-- Print one sub-account index per line for the given EOA wallet. Used by
     bash/zsh completion: when `--account` follows a command where it selects
-    a sub-account (e.g. `send`, `eoa send`), Tab cycles through these indices.
-    Falls back to `readDefaultAccount` when no wallet name is given. Silent on
-    every error so completion never pollutes stderr. -/
+    a sub-account, Tab cycles through these indices. Falls back to
+    `readDefaultAccount` when no wallet name is given. Silent on every error
+    so completion never pollutes stderr. -/
 def printAccountListIndices (wallet? : Option String) : IO UInt32 := do
   let resolved? : Option String ← match wallet? with
     | some w => pure (some w)
@@ -151,20 +163,18 @@ def printAccountListIndices (wallet? : Option String) : IO UInt32 := do
   match resolved? with
   | none => pure 0
   | some w =>
-      -- Strip any `<slot>/<sub>` form: indices belong to the top-level slot.
       let slotName := (w.splitOn "/").headD w
-      match ← DaemonClient.call "eoa.account.list"
-            (.obj #[("name", .str slotName)]) with
-      | .error _ => pure 0
-      | .ok r =>
-          let entries := (LeanKohaku.Encoding.Json.getField "accounts" r
+      for e in (← fetchAccountList) do
+        let entryName := (LeanKohaku.Encoding.Json.getField "name" e
+                          >>= LeanKohaku.Encoding.Json.asString).getD ""
+        if entryName = slotName then
+          let indices := (LeanKohaku.Encoding.Json.getField "indices" e
                           >>= LeanKohaku.Encoding.Json.asArray).getD #[]
-          for e in entries do
-            match LeanKohaku.Encoding.Json.getField "index" e
-                  >>= LeanKohaku.Encoding.Json.asNat with
+          for ie in indices do
+            match LeanKohaku.Encoding.Json.asNat ie with
             | some n => IO.println (toString n)
             | none => pure ()
-          pure 0
+      pure 0
 
 /-- Print one `wallet/index` per line, optionally followed by `\t<address>`.
     With no filter, walks every EOA wallet from `eoa.list`. Silent on every

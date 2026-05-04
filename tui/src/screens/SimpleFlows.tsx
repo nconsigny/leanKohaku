@@ -257,7 +257,12 @@ export function BalanceRefreshScreen({
 
 /** A static "more commands" screen with a hint that these are CLI-only
  *  for now. Honest about scope. */
-export type MoreAction = "resolve" | "decode-intent" | "back";
+export type MoreAction =
+  | "resolve"
+  | "decode-intent"
+  | "decode-typed-data"
+  | "llm-draft"
+  | "back";
 
 export function MoreCommandsScreen({
   onDone,
@@ -271,7 +276,9 @@ export function MoreCommandsScreen({
   });
 
   const items: { label: string; value: MoreAction }[] = [
+    { label: "Ask the agent (NL → calldata draft)",           value: "llm-draft" },
     { label: "Decode transaction (ERC-7730)",                 value: "decode-intent" },
+    { label: "Decode typed data (EIP-712)",                   value: "decode-typed-data" },
     { label: "Resolve ENS name",                              value: "resolve" },
     { label: "← Back",                                         value: "back" },
   ];
